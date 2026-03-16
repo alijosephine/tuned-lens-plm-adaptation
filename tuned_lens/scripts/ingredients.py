@@ -31,6 +31,7 @@ from typing_extensions import Literal
 
 from tuned_lens.data import (
     chunk_and_tokenize,
+    dataset_from_fasta,
 )
 from tuned_lens.model_surgery import get_transformer_layers
 from tuned_lens.nn.lenses import Lens
@@ -74,7 +75,10 @@ class Data:
         logger.info(f"Loading dataset '{' '.join(self.name)}'")
         logger.debug(f"Using split '{self.split}', revision '{self.revision}'")
 
-        if len(self.name) == 1 and self.name[0].endswith(".jsonl"):
+        if len(self.name) == 1 and self.name[0].lower().endswith(".fasta"):
+            logger.info(f"Loading local FASTA file '{self.name[0]}'")
+            dataset = dataset_from_fasta(self.name[0], text_key=self.text_column)
+        elif len(self.name) == 1 and self.name[0].endswith(".jsonl"):
             dataset = Dataset.from_json(self.name[0])
             assert isinstance(dataset, Dataset)
         else:
@@ -129,6 +133,9 @@ class Model:
     tokenizer_type: Optional[str] = None
     """Name of tokenizer class to use. If None, will use AutoTokenizer."""
 
+    trust_remote_code: bool = field(action="store_true")
+    """Allow loading model/tokenizer repos that define custom Python code."""
+
     def load_tokenizer(self, must_use_cache: bool = False) -> PreTrainedTokenizerBase:
         """Load the tokenizer from huggingface hub."""
         with handle_name_conflicts():
@@ -138,6 +145,7 @@ class Model:
                 use_fast=not self.slow_tokenizer,
                 tokenizer_type=self.tokenizer_type,
                 local_files_only=must_use_cache,
+                trust_remote_code=self.trust_remote_code,
             )
 
         assert isinstance(tokenizer, PreTrainedTokenizerBase)
@@ -155,8 +163,14 @@ class Model:
         """
         logger.info(f"Loading pretrained weights for '{self.name}'...")
         logger.debug(
-            "Using revision {revision} dtype {dtype}, and device {device}".format(
-                revision=self.revision, dtype=self.precision, device=device
+            (
+                "Using revision {revision} dtype {dtype}, and device {device}, "
+                "trust_remote_code={trust_remote_code}"
+            ).format(
+                revision=self.revision,
+                dtype=self.precision,
+                device=device,
+                trust_remote_code=self.trust_remote_code,
             )
         )
 
@@ -181,6 +195,7 @@ class Model:
                 revision=self.revision,
                 torch_dtype=dtype,
                 local_files_only=must_use_cache,
+                trust_remote_code=self.trust_remote_code,
             )
 
         assert isinstance(model, PreTrainedModel)

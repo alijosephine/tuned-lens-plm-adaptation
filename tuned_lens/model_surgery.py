@@ -71,13 +71,25 @@ Norm = Union[
 ]
 
 
+def _is_progen_model(obj: Any) -> bool:
+    """Return True for known ProGen2 model class names."""
+    return type(obj).__name__ in {"ProGenForCausalLM", "ProGenModel"}
+
+
 def get_unembedding_matrix(model: Model) -> nn.Linear:
     """The final linear tranformation from the model hidden state to the output."""
     if isinstance(model, tr.PreTrainedModel):
+        # ProGen2 exposes output projection as `lm_head`.
+        if _is_progen_model(model):
+            lm_head = getattr(model, "lm_head", None)
+            if isinstance(lm_head, nn.Linear):
+                return lm_head
+
         unembed = model.get_output_embeddings()
-        if not isinstance(unembed, nn.Linear):
-            raise ValueError("We currently only support linear unemebdings")
-        return unembed
+        if isinstance(unembed, nn.Linear):
+            return unembed
+
+        raise ValueError("We currently only support models with a linear unembedding")
     elif _transformer_lens_available and isinstance(model, tl.HookedTransformer):
         linear = nn.Linear(
             in_features=model.cfg.d_model,
@@ -123,6 +135,8 @@ def get_final_norm(model: Model) -> Norm:
         final_layer_norm = base_model.norm
     elif isinstance(base_model, models.gemma.modeling_gemma.GemmaModel):
         final_layer_norm = base_model.norm
+    elif _is_progen_model(base_model):
+        final_layer_norm = base_model.ln_f
     else:
         raise NotImplementedError(f"Unknown model type {type(base_model)}")
 
@@ -172,11 +186,16 @@ def get_transformer_layers(model: Model) -> tuple[str, th.nn.ModuleList]:
         path_to_layers += ["layers"]
     elif isinstance(base_model, models.gemma.modeling_gemma.GemmaModel):
         path_to_layers += ["layers"]
+    elif _is_progen_model(base_model):
+        path_to_layers += ["h"]
     else:
         raise NotImplementedError(f"Unknown model type {type(base_model)}")
 
     path_to_layers = ".".join(path_to_layers)
-    return path_to_layers, get_key_path(model, path_to_layers)
+    layer_list = get_key_path(model, path_to_layers)
+    if not isinstance(layer_list, th.nn.ModuleList):  # TODO: maybe this check not required!!
+        raise ValueError(f"Expected ModuleList at '{path_to_layers}', got {type(layer_list)}")
+    return path_to_layers, layer_list
 
 
 @contextmanager

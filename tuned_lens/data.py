@@ -1,12 +1,49 @@
 """Tools for tokenizing and manipulating text datasets."""
 import math
 from multiprocessing import cpu_count
-from typing import TypeVar, Union
+from pathlib import Path
+from typing import Iterator, TypeVar, Union
 
 from datasets import Dataset, DatasetDict
 from transformers import PreTrainedTokenizerBase
 
 T = TypeVar("T", bound=Union[Dataset, DatasetDict])
+
+
+def _iter_fasta_records(path: str, text_key: str) -> Iterator[dict[str, str]]:
+    """Yield FASTA sequences as records with a text field.
+
+    FASTA headers are ignored because training only requires the sequence text.
+    """
+    with open(path, "r") as f:
+        seq_lines: list[str] = []
+        for line in f:
+            if line.startswith(">"):
+                if seq_lines:
+                    yield {text_key: "".join(seq_lines)}
+                    seq_lines = []
+                continue
+
+            seq = line.strip()
+            if seq:
+                seq_lines.append(seq)
+
+        if seq_lines:
+            yield {text_key: "".join(seq_lines)}
+
+
+def dataset_from_fasta(path: str, text_key: str = "text") -> Dataset:
+    """Load a local FASTA file as a Hugging Face Dataset."""
+    fasta_path = Path(path)
+    if not fasta_path.exists():
+        raise FileNotFoundError(f"FASTA file not found: {path}")
+
+    dataset = Dataset.from_generator(
+        _iter_fasta_records,
+        gen_kwargs={"path": path, "text_key": text_key},
+    )
+    assert isinstance(dataset, Dataset)
+    return dataset
 
 
 def chunk_and_tokenize(

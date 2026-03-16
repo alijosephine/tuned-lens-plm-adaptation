@@ -138,3 +138,14 @@ dmypy.json
 .pyre/
 .idea/workspace.xml
 .vscode/launch.json
+
+# pLM adaptations:
+.vscode/
+notes_for_local_tunedlens.txt
+notes_for_plm_depth_analysis.txt
+data/*
+run/*
+out/*
+out/trained_models/*
+out/slurm_logs/*
+
