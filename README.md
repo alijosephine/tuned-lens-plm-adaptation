@@ -1,3 +1,8 @@
+# Tuned Lens Adaptation for Protein Language Models:  
+This is a fork of Tuned Lens with the intention of adapting it for protein langauge models. The relevant changes and documentation can be found in branch ```fork-branch```.  
+(Preserving the original readme below.) 
+
+
 # Tuned Lens 🔎
 <a target="_blank" href="https://colab.research.google.com/github/AlignmentResearch/tuned-lens/blob/main/notebooks/interactive.ipynb">
   <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
