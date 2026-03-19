@@ -20,6 +20,7 @@ from tuned_lens.scripts.ingredients import (
 )
 from tuned_lens.stats import LogitStats
 from tuned_lens.utils import (
+    mask_input_ids_for_mlm,
     maybe_all_reduce,
     pytree_map,
     pytree_stack,
@@ -62,7 +63,7 @@ class Eval:
     tokens: Optional[int] = None
     """Number of tokens to evaluate on. If None, will use the entire dataset."""
 
-    token_shift: int = field(default=1)
+    token_shift: Optional[int] = field(default=None)
     """How to shift the labels wrt the input tokens (1 = next token, 0 = current token,
     -1 = previous token, etc.)"""
 
@@ -74,6 +75,22 @@ class Eval:
 
     record_logit_stats: bool = field(action="store_true")
     """Record the statistics of the marginal token distribution at each layer."""
+
+    mlm_probability: float = 0.15
+    """Masking probability for masked-LM models."""
+
+    def _is_masked_model(self, _model: PreTrainedModel) -> bool:
+        """Return True only when masked mode is explicitly selected."""
+        return self.model.model_type == "masked"
+
+    @staticmethod
+    def _masked_mean(x: th.Tensor, valid_mask: Optional[th.Tensor]) -> th.Tensor:
+        """Average tensor values, optionally over a boolean mask."""
+        if valid_mask is None:
+            return x.mean()
+        if valid_mask.any():
+            return x[valid_mask].mean()
+        return x.new_tensor(0.0)
 
     def load_lens(self, model: PreTrainedModel) -> dict[str, Lens]:
         """Load the tuned lens model."""
@@ -140,6 +157,8 @@ class Eval:
         final_probs: th.Tensor,
         final_lps: th.Tensor,
         labels: th.Tensor,
+        shift: int,
+        valid_mask: Optional[th.Tensor],
         batch_output: defaultdict,
         total_layers: int,
     ):
@@ -162,36 +181,52 @@ class Eval:
             layer_name = f"layer_{layer}"
             lens_lps = lens(hidden, idx=layer).log_softmax(dim=-1)
             lens_probs = lens_lps.exp()
+            shifted_lens_lps = shift_preds(lens_lps, shift)
 
             self._record_logit_stats(lens_lps, layer, lens_type)
 
-            batch_output[lens_type]["ce"][layer_name] = th.nn.functional.cross_entropy(
-                shift_preds(lens_lps, self.token_shift).flatten(0, 1),
+            ce = th.nn.functional.cross_entropy(
+                shifted_lens_lps.flatten(0, 1),
                 labels.flatten(),
                 reduction="none",
+                ignore_index=-100,
+            )
+            batch_output[lens_type]["ce"][layer_name] = self._masked_mean(
+                ce.view_as(labels), valid_mask
             )
 
-            batch_output[lens_type]["entropy"][layer_name] = th.sum(
+            entropy = th.sum(
                 -lens_probs * lens_lps, dim=-1
             )
+            batch_output[lens_type]["entropy"][layer_name] = self._masked_mean(
+                entropy, valid_mask
+            )
 
-            batch_output[lens_type]["kl"][layer_name] = th.sum(
+            kl = th.sum(
                 final_probs * (final_lps - lens_lps), dim=-1
             )
+            batch_output[lens_type]["kl"][layer_name] = self._masked_mean(kl, valid_mask)
 
             if self.layer_transfer:
                 for i in range(total_layers):
                     trans_name = f"layer_{i}"
                     transfer_lps = lens(hidden, idx=i).log_softmax(dim=-1)
+                    shifted_transfer_lps = shift_preds(transfer_lps, shift)
                     batch_output[lens_type]["layer_transfer"]["ce"][trans_name][
                         layer_name
-                    ] = th.nn.functional.cross_entropy(
-                        shift_preds(transfer_lps, self.token_shift).flatten(0, 1),
-                        labels.flatten(),
+                    ] = self._masked_mean(
+                        th.nn.functional.cross_entropy(
+                            shifted_transfer_lps.flatten(0, 1),
+                            labels.flatten(),
+                            reduction="none",
+                            ignore_index=-100,
+                        ).view_as(labels),
+                        valid_mask,
                     )
+                    transfer_kl = th.sum(lens_probs * (lens_lps - transfer_lps), dim=-1)
                     batch_output[lens_type]["layer_transfer"]["kl"][trans_name][
                         layer_name
-                    ] = th.sum(lens_probs * (lens_lps - transfer_lps), dim=-1).mean()
+                    ] = self._masked_mean(transfer_kl, valid_mask)
 
     @th.autocast("cuda", enabled=th.cuda.is_available())
     @th.no_grad()
@@ -206,7 +241,9 @@ class Eval:
         if self.dist.primary:
             # Let the primary processes populate the cache
             model, tokenizer = self.model.load(load_device)
-            data, nats_to_bpb = self.data.load(tokenizer)
+            data, nats_to_bpb = self.data.load(
+                tokenizer, model_type=self.model.model_type
+            )
             lenses = self.load_lens(model)
 
         self.dist.barrier()  # Wait for primary to finish filling the cache
@@ -214,10 +251,23 @@ class Eval:
         if not self.dist.primary:
             # Let the non-primary processes load from the cache
             model, tokenizer = self.model.load(load_device, must_use_cache=True)
-            data, nats_to_bpb = self.data.load(tokenizer)
+            data, nats_to_bpb = self.data.load(
+                tokenizer, model_type=self.model.model_type
+            )
             lenses = self.load_lens(model)
 
         assert model and tokenizer and data and lenses and nats_to_bpb
+
+        self._masked_model = self._is_masked_model(model)
+        if self._masked_model:
+            mask_token_id = tokenizer.mask_token_id
+            if mask_token_id is None:
+                raise ValueError(
+                    f"Tokenizer '{tokenizer.__class__.__name__}' does not define a "
+                    "mask token, but model is configured as masked-LM."
+                )
+            self._mask_token_id = int(mask_token_id)
+            self._special_token_ids = list(tokenizer.all_special_ids)
 
         model = self.dist.shard_model(model)
         # Note since we are not training we can just move the lens to the device.
@@ -262,6 +312,16 @@ class Eval:
         pbar = tqdm(dl, desc="Evaluating", position=self.dist.rank, total=total)
         for batch in pbar:
             batch = self.dist.send_to_device(batch)
+            ce_labels = batch["input_ids"]
+            if self._masked_model:
+                masked_input_ids, ce_labels = mask_input_ids_for_mlm(
+                    batch["input_ids"],
+                    self._mask_token_id,
+                    self._special_token_ids,
+                    self.mlm_probability,
+                )
+                batch["input_ids"] = masked_input_ids
+
             output = model(**batch, output_hidden_states=True)
 
             hidden_states = output.hidden_states[:-1]
@@ -271,7 +331,12 @@ class Eval:
             final_probs = final_lps.exp()
             assert not th.isnan(output.logits).any(), "Logits are NaN"
 
-            labels = shift_labels(batch["input_ids"], self.token_shift)
+            shift = self.token_shift
+            if shift is None:
+                shift = 0 if self._masked_model else 1  # TODO: potentially mismatch between traina nd eval for KL loss in causal models!
+
+            labels = shift_labels(ce_labels, shift)
+            valid_mask = labels != -100 if self._masked_model else None
 
             batch_output = _nested_dict()
 
@@ -284,17 +349,26 @@ class Eval:
                     final_probs=final_probs,
                     final_lps=final_lps,
                     labels=labels,
+                    shift=shift,
+                    valid_mask=valid_mask,
                     batch_output=batch_output,
                     total_layers=L,
                 )
 
-            batch_output["baseline"]["ce"]["final"] = th.nn.functional.cross_entropy(
-                shift_preds(final_lps, self.token_shift).flatten(0, 1),
+            baseline_ce = th.nn.functional.cross_entropy(
+                shift_preds(final_lps, shift).flatten(0, 1),
                 labels.flatten(),
                 reduction="none",
+                ignore_index=-100,
             )
-            batch_output["baseline"]["entropy"]["final"] = th.sum(
+            batch_output["baseline"]["ce"]["final"] = self._masked_mean(
+                baseline_ce.view_as(labels), valid_mask
+            )
+            baseline_entropy = th.sum(
                 -final_probs * final_lps, dim=-1
+            )
+            batch_output["baseline"]["entropy"]["final"] = self._masked_mean(
+                baseline_entropy, valid_mask
             )
 
             batches.append(pytree_map(th.mean, batch_output))  # type: ignore[arg-type]
@@ -325,3 +399,5 @@ class Eval:
             if self.record_logit_stats:
                 with (root_dir / "logit_stats.json").open("w") as f:
                     json.dump(logit_stats, f)
+
+# TODO: review eval script and shapes for maskd vs causal models (and shift = 0 or 2 or None)! for both ce loss and kl loss!

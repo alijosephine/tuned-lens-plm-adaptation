@@ -22,6 +22,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torchdata import dataloader2, datapipes
 from transformers import (
     AutoModelForCausalLM,
+    AutoModelForMaskedLM,
     AutoTokenizer,
     PreTrainedModel,
     PreTrainedTokenizerBase,
@@ -70,7 +71,11 @@ class Data:
     dataset_shuffle_seed: int = 42
     """Seed to use for shuffling the dataset"""
 
-    def load(self, tokenizer: PreTrainedTokenizerBase) -> tuple[Dataset, float]:
+    def load(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        model_type: Literal["causal", "masked"] = "causal",
+    ) -> tuple[Dataset, float]:
         """Load the dataset, tokenize it and compute nats_to_bpb."""
         logger.info(f"Loading dataset '{' '.join(self.name)}'")
         logger.debug(f"Using split '{self.split}', revision '{self.revision}'")
@@ -99,6 +104,7 @@ class Data:
         processed, nats_to_bpb = chunk_and_tokenize(
             dataset,
             tokenizer,
+            model_type=model_type,
             text_key=self.text_column,
             max_seq_len=self.max_seq_len,
         )
@@ -136,6 +142,13 @@ class Model:
     trust_remote_code: bool = field(action="store_true")
     """Allow loading model/tokenizer repos that define custom Python code."""
 
+    model_type: Literal["causal", "masked"] = "causal"
+    """Model head type to load.
+
+    - "causal": force AutoModelForCausalLM.
+    - "masked": force AutoModelForMaskedLM.
+    """
+
     def load_tokenizer(self, must_use_cache: bool = False) -> PreTrainedTokenizerBase:
         """Load the tokenizer from huggingface hub."""
         with handle_name_conflicts():
@@ -158,19 +171,20 @@ class Model:
 
         Args:
             device: The device to load the model on. Implemented with the `device_map`
-                argument of `AutoModelForCausalLM.from_pretrained`.
+                argument of `from_pretrained`.
             must_use_cache: If True, will raise an error if the model is not cached.
         """
         logger.info(f"Loading pretrained weights for '{self.name}'...")
         logger.debug(
             (
                 "Using revision {revision} dtype {dtype}, and device {device}, "
-                "trust_remote_code={trust_remote_code}"
+                "trust_remote_code={trust_remote_code}, model_type={model_type}"
             ).format(
                 revision=self.revision,
                 dtype=self.precision,
                 device=device,
                 trust_remote_code=self.trust_remote_code,
+                model_type=self.model_type,
             )
         )
 
@@ -186,8 +200,15 @@ class Model:
         except KeyError as e:
             raise ValueError(f"Unknown precision: {self.precision}") from e
 
+        if self.model_type == "causal":
+            auto_model_cls = AutoModelForCausalLM
+        elif self.model_type == "masked":
+            auto_model_cls = AutoModelForMaskedLM
+        else:
+            raise ValueError(f"Unknown model_type: {self.model_type}")
+
         with handle_name_conflicts():
-            model = AutoModelForCausalLM.from_pretrained(  # type: ignore
+            model = auto_model_cls.from_pretrained(  # type: ignore
                 self.name,
                 device_map={"": device} if device is not None else None,
                 load_in_8bit=self.precision == "int8",
@@ -197,6 +218,7 @@ class Model:
                 local_files_only=must_use_cache,
                 trust_remote_code=self.trust_remote_code,
             )
+        logger.info(f"Loaded model using '{self.model_type}' head.")
 
         assert isinstance(model, PreTrainedModel)
         model.eval()

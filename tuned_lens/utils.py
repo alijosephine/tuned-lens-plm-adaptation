@@ -3,7 +3,7 @@
 import hashlib
 from contextlib import contextmanager
 from itertools import islice
-from typing import Any, Callable, Iterable, Sequence, Type, TypeVar, Union, cast
+from typing import Any, Callable, Iterable, Optional, Sequence, Type, TypeVar, Union, cast
 
 import numpy as np
 import torch as th
@@ -101,6 +101,54 @@ def shift_preds(x: th.Tensor, shift: int):
         return x[:, -shift:]
 
     return x
+
+
+def mask_input_ids_for_mlm(
+    input_ids: th.Tensor,
+    mask_token_id: int,
+    special_token_ids: Sequence[int],
+    mlm_probability: float,
+    *,
+    generator: Optional[th.Generator] = None,
+) -> tuple[th.Tensor, th.Tensor]:
+    """Create masked inputs and labels for MLM training/evaluation.
+
+    Args:
+        input_ids: Tensor of token ids with shape (batch, seq_len).
+        mask_token_id: Token id used for masking.
+        special_token_ids: Token ids that should never be masked.
+        mlm_probability: Independent masking probability per non-special token.
+        generator: Optional torch generator for deterministic sampling.
+
+    Returns:
+        A tuple `(masked_input_ids, labels)` where labels are `-100` for tokens that are
+        not masked, suitable for use with `cross_entropy(..., ignore_index=-100)`.
+    """
+    if not 0.0 <= mlm_probability <= 1.0:
+        raise ValueError(f"mlm_probability must be in [0, 1], got {mlm_probability}.")
+
+    labels = input_ids.clone()
+    prob = th.full_like(input_ids, fill_value=mlm_probability, dtype=th.float)
+
+    special_mask = th.zeros_like(input_ids, dtype=th.bool)
+    for token_id in special_token_ids:
+        special_mask |= input_ids.eq(token_id)
+    prob.masked_fill_(special_mask, 0.0)
+
+    masked_positions = th.bernoulli(prob, generator=generator).bool()
+
+    # Avoid pathological all-ignore batches, which cause CE to become NaN.
+    if not masked_positions.any():
+        valid_positions = ~special_mask
+        if valid_positions.any():
+            first_valid = valid_positions.flatten().nonzero(as_tuple=False)[0]
+            masked_positions.view(-1)[first_valid] = True
+
+    masked_input_ids = input_ids.clone()
+    masked_input_ids.masked_fill_(masked_positions, mask_token_id)
+    labels.masked_fill_(~masked_positions, -100)
+
+    return masked_input_ids, labels
 
 
 T = TypeVar("T")

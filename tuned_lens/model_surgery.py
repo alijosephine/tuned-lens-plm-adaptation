@@ -76,6 +76,11 @@ def _is_progen_model(obj: Any) -> bool:
     return type(obj).__name__ in {"ProGenForCausalLM", "ProGenModel"}
 
 
+def _is_esm_model(obj: Any) -> bool:
+    """Return True for ESM/ESM2 base model classes."""
+    return type(obj).__name__ in {"EsmModel"}
+
+
 def get_unembedding_matrix(model: Model) -> nn.Linear:
     """The final linear tranformation from the model hidden state to the output."""
     if isinstance(model, tr.PreTrainedModel):
@@ -135,6 +140,8 @@ def get_final_norm(model: Model) -> Norm:
         final_layer_norm = base_model.norm
     elif isinstance(base_model, models.gemma.modeling_gemma.GemmaModel):
         final_layer_norm = base_model.norm
+    elif _is_esm_model(base_model):
+        final_layer_norm = base_model.encoder.emb_layer_norm_after
     elif _is_progen_model(base_model):
         final_layer_norm = base_model.ln_f
     else:
@@ -186,6 +193,8 @@ def get_transformer_layers(model: Model) -> tuple[str, th.nn.ModuleList]:
         path_to_layers += ["layers"]
     elif isinstance(base_model, models.gemma.modeling_gemma.GemmaModel):
         path_to_layers += ["layers"]
+    elif _is_esm_model(base_model):
+        path_to_layers += ["encoder", "layer"]
     elif _is_progen_model(base_model):
         path_to_layers += ["h"]
     else:

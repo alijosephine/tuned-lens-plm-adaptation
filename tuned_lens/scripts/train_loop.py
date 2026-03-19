@@ -20,7 +20,12 @@ from transformers import PreTrainedModel
 
 import tuned_lens.scripts.ingredients as ing
 from tuned_lens import TunedLens
-from tuned_lens.utils import maybe_all_reduce, shift_labels, shift_preds
+from tuned_lens.utils import (
+    mask_input_ids_for_mlm,
+    maybe_all_reduce,
+    shift_labels,
+    shift_preds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,10 +129,17 @@ class Train:
     loss: LossChoice = LossChoice.KL
     """Loss function to use."""
 
+    mlm_probability: float = 0.15
+    """Masking probability for masked-LM models."""
+
     def __post_init__(self):
         """Set defaults for some fields."""
         if self.checkpoint_dir is None:
             self.checkpoint_dir = self.output / "checkpoints"
+
+    def _is_masked_model(self, _model: PreTrainedModel) -> bool:
+        """Return True only when masked mode is explicitly selected."""
+        return self.model.model_type == "masked"
 
     def get_lens(self, model: PreTrainedModel) -> TunedLens:
         """Load or create a TunedLens model."""
@@ -318,7 +330,9 @@ class Train:
         if self.dist.primary:
             logger.debug("Primary rank populating cache...")
             model, tokenizer = self.model.load(load_device)
-            data, nats_to_bpb = self.data.load(tokenizer)
+            data, nats_to_bpb = self.data.load(
+                tokenizer, model_type=self.model.model_type
+            )
             lens = self.get_lens(model)
 
         self.dist.barrier()  # Wait for primary to finish filling the cache
@@ -327,10 +341,23 @@ class Train:
             # Let the non-primary processes load from the cache
             logger.debug("Non-primary rank loading from cache...")
             model, tokenizer = self.model.load(load_device, must_use_cache=True)
-            data, nats_to_bpb = self.data.load(tokenizer)
+            data, nats_to_bpb = self.data.load(
+                tokenizer, model_type=self.model.model_type
+            )
             lens = self.get_lens(model)
 
         assert model and tokenizer and data and lens and nats_to_bpb
+
+        self._masked_model = self._is_masked_model(model)
+        if self._masked_model:
+            mask_token_id = tokenizer.mask_token_id
+            if mask_token_id is None:
+                raise ValueError(
+                    f"Tokenizer '{tokenizer.__class__.__name__}' does not define a "
+                    "mask token, but model is configured as masked-LM."
+                )
+            self._mask_token_id = int(mask_token_id)
+            self._special_token_ids = list(tokenizer.all_special_ids)
 
         logger.debug(f"Creating data loader and setting seed to {self.seed} ...")
         dl = self.dist.dataloader(data)
@@ -395,8 +422,18 @@ class Train:
         for batch_idx, batch in zip(t, state.dataloader):
             assert isinstance(batch, dict), f"Expected dict, got {type(batch)}"
 
+            batch = self.dist.send_to_device(batch)
+            target_labels = batch["input_ids"]
+            if self._masked_model:
+                masked_input_ids, target_labels = mask_input_ids_for_mlm(
+                    batch["input_ids"],
+                    self._mask_token_id,
+                    self._special_token_ids,
+                    self.mlm_probability,
+                )
+                batch["input_ids"] = masked_input_ids
+
             with th.no_grad():
-                batch = self.dist.send_to_device(batch)
                 output = model(**batch, output_hidden_states=True)
 
             final_logits = output.logits
@@ -404,17 +441,23 @@ class Train:
 
             shift = self.token_shift
             if self.loss == LossChoice.CE:
-                labels = batch["input_ids"]
+                labels = target_labels
 
-                # Predict the *next* token by default w/ cross entropy
+                # Predict the *current* token by default for masked-LMs and the
+                # *next* token by default for causal LMs.
                 if shift is None:
-                    shift = 1
+                    shift = 0 if self._masked_model else 1
             elif self.loss == LossChoice.KL:
                 labels = final_logits.float().log_softmax(dim=-1)
 
                 # Match the *current* token distribution by default
                 if shift is None:
-                    shift = 0
+                    shift = 0  # unlike CE labels derived from input, shift not needed here!
+                if self._masked_model:
+                    shifted_target_labels = shift_labels(target_labels, shift)
+                    valid_kl_mask = shifted_target_labels != -100
+                else:
+                    valid_kl_mask = None
             else:
                 raise NotImplementedError(f"Unknown loss {self.loss}")
 
@@ -430,12 +473,25 @@ class Train:
 
                     if self.loss == LossChoice.CE:
                         loss = th.nn.functional.cross_entropy(
-                            logits.flatten(0, -2), labels.flatten()
+                            logits.flatten(0, -2),
+                            labels.flatten(),
+                            ignore_index=-100,
                         )
                     elif self.loss == LossChoice.KL:
-                        loss = th.sum(
+                        token_kl = th.sum(
                             labels.exp() * (labels - logits.log_softmax(-1)), dim=-1
-                        ).mean()
+                        )
+                        if valid_kl_mask is None:
+                            loss = token_kl.mean()
+                        else:
+                            valid_count = valid_kl_mask.sum()
+                            if valid_count.item() == 0:
+                                # Keep the graph valid while contributing no gradient.
+                                loss = token_kl.sum() * 0.0
+                            else:
+                                loss = (
+                                    token_kl * valid_kl_mask.to(token_kl.dtype)
+                                ).sum() / valid_count.to(token_kl.dtype)
                     else:
                         raise NotImplementedError
 

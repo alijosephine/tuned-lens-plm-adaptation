@@ -2,7 +2,7 @@
 import math
 from multiprocessing import cpu_count
 from pathlib import Path
-from typing import Iterator, TypeVar, Union
+from typing import Iterator, Literal, TypeVar, Union
 
 from datasets import Dataset, DatasetDict
 from transformers import PreTrainedTokenizerBase
@@ -11,7 +11,7 @@ T = TypeVar("T", bound=Union[Dataset, DatasetDict])
 
 
 def _iter_fasta_records(path: str, text_key: str) -> Iterator[dict[str, str]]:
-    """Yield FASTA sequences as records with a text field.
+    """Yield FASTA sequences as records with a sequence field.
 
     FASTA headers are ignored because training only requires the sequence text.
     """
@@ -32,7 +32,7 @@ def _iter_fasta_records(path: str, text_key: str) -> Iterator[dict[str, str]]:
             yield {text_key: "".join(seq_lines)}
 
 
-def dataset_from_fasta(path: str, text_key: str = "text") -> Dataset:
+def dataset_from_fasta(path: str, text_key: str = "sequence") -> Dataset:
     """Load a local FASTA file as a Hugging Face Dataset."""
     fasta_path = Path(path)
     if not fasta_path.exists():
@@ -50,6 +50,7 @@ def chunk_and_tokenize(
     data: T,
     tokenizer: PreTrainedTokenizerBase,
     *,
+    model_type: Literal["causal", "masked"] = "causal",
     format: str = "torch",
     num_proc: int = min(cpu_count() // 2, 8),
     text_key: str = "text",
@@ -57,16 +58,19 @@ def chunk_and_tokenize(
     return_final_batch: bool = False,
     load_from_cache_file: bool = True,
 ) -> tuple[T, float]:
-    """Perform GPT-style chunking and tokenization on a dataset.
+    """Tokenize a dataset for causal or masked language modeling.
 
-    The resulting dataset will consist entirely of chunks exactly `max_seq_len` tokens
-    long. Long sequences will be split into multiple chunks, and short sequences will
-    be merged with their neighbors, using `eos_token` as a separator. The fist token
-    will also always be an `eos_token`.
+    For `model_type="causal"`, this performs GPT-style concatenation/chunking: short
+    sequences are merged with EOS separators and then split into fixed windows.
+
+    For `model_type="masked"`, each sequence is tokenized independently and padded to
+    `max_seq_len` so sample boundaries are preserved. (else attention across boundarie smight be an issue!)
+    but use max_seq_len ~ 512 so that not many tokens wasted on padding (and that is roughly the length we use for deth analysis anyway!)
 
     Args:
         data: The dataset to chunk and tokenize.
         tokenizer: The tokenizer to use.
+        model_type: Whether to tokenize for a causal or masked LM workflow.
         format: The format to return the dataset in, passed to `Dataset.with_format`.
         num_proc: The number of processes to use for tokenization.
         text_key: The key in the dataset to use as the text to tokenize.
@@ -81,7 +85,7 @@ def chunk_and_tokenize(
             section 3.1.
     """
 
-    def _tokenize_fn(x: dict[str, list]):
+    def _tokenize_causal_fn(x: dict[str, list]):
         chunk_size = min(tokenizer.model_max_length, max_seq_len)
         sep = tokenizer.eos_token or "<|endoftext|>"
         joined_text = sep.join([""] + x[text_key])
@@ -133,8 +137,46 @@ def chunk_and_tokenize(
 
         return output
 
+    def _tokenize_masked_fn(x: dict[str, list]):
+        if tokenizer.pad_token_id is None:
+            raise ValueError(
+                "Masked tokenization requires a tokenizer with `pad_token_id`."
+            )
+
+        chunk_size = min(tokenizer.model_max_length, max_seq_len)
+        texts = x[text_key]
+        output = tokenizer(
+            texts,
+            max_length=chunk_size,
+            padding="max_length",
+            return_attention_mask=True,
+            truncation=True,
+        )
+
+        input_ids = output["input_ids"]
+        attention_mask = output["attention_mask"]
+        output_batch_size = len(input_ids)
+        if output_batch_size == 0:
+            raise ValueError("Tokenizer returned an empty batch.")
+
+        # Track non-padding token counts for metrics conversion.
+        lengths = [sum(mask) for mask in attention_mask]
+        byte_counts = [len(text.encode("utf-8")) for text in texts]
+
+        output["length"] = lengths
+        output["bytes"] = byte_counts
+
+        return output
+
+    if model_type == "causal":
+        tokenize_fn = _tokenize_causal_fn
+    elif model_type == "masked":
+        tokenize_fn = _tokenize_masked_fn
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
     data = data.map(
-        _tokenize_fn,
+        tokenize_fn,
         # Batching is important for ensuring that we don't waste tokens
         # since we always throw away the last element of the batch we
         # want to keep the batch size as large as possible
@@ -146,7 +188,12 @@ def chunk_and_tokenize(
     )
     total_bytes: float = sum(data["bytes"])
     total_tokens: float = sum(data["length"])
-    return data.with_format(format, columns=["input_ids"]), (
+
+    columns = ["input_ids"]
+    if model_type == "masked": #TODO: is this really required? or do models (e.g. ESM2) build its own attention amsk based on padding tokens?
+        columns.append("attention_mask")
+
+    return data.with_format(format, columns=columns), (
         total_tokens / total_bytes
     ) / math.log(2)
 
