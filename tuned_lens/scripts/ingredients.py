@@ -23,6 +23,7 @@ from torchdata import dataloader2, datapipes
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForMaskedLM,
+    AutoModelForSeq2SeqLM,
     AutoTokenizer,
     PreTrainedModel,
     PreTrainedTokenizerBase,
@@ -74,7 +75,7 @@ class Data:
     def load(
         self,
         tokenizer: PreTrainedTokenizerBase,
-        model_type: Literal["causal", "masked"] = "causal",
+        model_type: Literal["causal", "masked", "encoder-decoder"] = "causal",
     ) -> tuple[Dataset, float]:
         """Load the dataset, tokenize it and compute nats_to_bpb."""
         logger.info(f"Loading dataset '{' '.join(self.name)}'")
@@ -142,11 +143,12 @@ class Model:
     trust_remote_code: bool = field(action="store_true")
     """Allow loading model/tokenizer repos that define custom Python code."""
 
-    model_type: Literal["causal", "masked"] = "causal"
+    model_type: Literal["causal", "masked", "encoder-decoder"] = "causal"
     """Model head type to load.
 
-    - "causal": force AutoModelForCausalLM.
-    - "masked": force AutoModelForMaskedLM.
+    - "causal": use AutoModelForCausalLM.
+    - "masked": use AutoModelForMaskedLM.
+    - "encoder-decoder": use AutoModelForSeq2SeqLM (e.g. ProtT5).
     """
 
     def load_tokenizer(self, must_use_cache: bool = False) -> PreTrainedTokenizerBase:
@@ -162,6 +164,19 @@ class Model:
             )
 
         assert isinstance(tokenizer, PreTrainedTokenizerBase)
+
+        # ProtT5 tokenizers do not define `mask_token` by default, but expose
+        # sentinel extra ids. Reuse <extra_id_0> for MLM masking.
+        if (
+            self.model_type in {"masked", "encoder-decoder"}
+            and tokenizer.mask_token_id is None
+        ):
+            sentinel = "<extra_id_0>"
+            sentinel_id = tokenizer.convert_tokens_to_ids(sentinel)
+            unk_id = getattr(tokenizer, "unk_token_id", None)
+            if isinstance(sentinel_id, int) and (unk_id is None or sentinel_id != unk_id):
+                tokenizer.mask_token = sentinel
+
         return tokenizer
 
     def load(
@@ -204,6 +219,8 @@ class Model:
             auto_model_cls = AutoModelForCausalLM
         elif self.model_type == "masked":
             auto_model_cls = AutoModelForMaskedLM
+        elif self.model_type == "encoder-decoder":
+            auto_model_cls = AutoModelForSeq2SeqLM
         else:
             raise ValueError(f"Unknown model_type: {self.model_type}")
 

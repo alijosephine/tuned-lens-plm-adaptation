@@ -46,11 +46,18 @@ def dataset_from_fasta(path: str, text_key: str = "sequence") -> Dataset:
     return dataset
 
 
+def _preprocess_protein_sequence_for_t5(seq: str) -> str:
+    """Process protein sequences for ProtT5 tokenizers."""
+    seq = str(seq).upper().replace("U", "X").replace("Z", "X").replace("O", "X").replace("B", "X")
+    seq = seq.replace(" ", "")
+    return " ".join(list(seq))
+
+
 def chunk_and_tokenize(
     data: T,
     tokenizer: PreTrainedTokenizerBase,
     *,
-    model_type: Literal["causal", "masked"] = "causal",
+    model_type: Literal["causal", "masked", "encoder-decoder"] = "causal",
     format: str = "torch",
     num_proc: int = min(cpu_count() // 2, 8),
     text_key: str = "text",
@@ -58,7 +65,7 @@ def chunk_and_tokenize(
     return_final_batch: bool = False,
     load_from_cache_file: bool = True,
 ) -> tuple[T, float]:
-    """Tokenize a dataset for causal or masked language modeling.
+    """Tokenize a dataset for causal, masked, or encoder-decoder models.
 
     For `model_type="causal"`, this performs GPT-style concatenation/chunking: short
     sequences are merged with EOS separators and then split into fixed windows.
@@ -67,14 +74,14 @@ def chunk_and_tokenize(
     be merged with their neighbors, using `eos_token` as a separator. The fist token
     will also always be an `eos_token`.
 
-    For `model_type="masked"`, each sequence is tokenized independently and padded to
+    For `model_type in {"masked", "encoder-decoder"}`, each sequence is tokenized independently and padded to
     `max_seq_len` so sample boundaries are preserved. (else attention across boundarie smight be an issue!)
     but use max_seq_len ~ 512 so that not many tokens wasted on padding (and that is roughly the length we use for deth analysis anyway!)
 
     Args:
         data: The dataset to chunk and tokenize.
         tokenizer: The tokenizer to use.
-        model_type: Whether to tokenize for a causal or masked LM workflow.
+        model_type: Whether to tokenize for causal, masked, or encoder-decoder.
         format: The format to return the dataset in, passed to `Dataset.with_format`.
         num_proc: The number of processes to use for tokenization.
         text_key: The key in the dataset to use as the text to tokenize.
@@ -148,7 +155,10 @@ def chunk_and_tokenize(
             )
 
         chunk_size = min(tokenizer.model_max_length, max_seq_len)
-        texts = x[text_key]
+        original_texts = x[text_key]
+        texts = original_texts
+        if type(tokenizer).__name__.startswith("T5Tokenizer"):
+            texts = [_preprocess_protein_sequence_for_t5(text) for text in original_texts]
         output = tokenizer(
             texts,
             max_length=chunk_size,
@@ -165,7 +175,7 @@ def chunk_and_tokenize(
 
         # Track non-padding token counts for metrics conversion.
         lengths = [sum(mask) for mask in attention_mask]
-        byte_counts = [len(text.encode("utf-8")) for text in texts]
+        byte_counts = [len(text.encode("utf-8")) for text in original_texts]
 
         output["length"] = lengths
         output["bytes"] = byte_counts
@@ -174,7 +184,7 @@ def chunk_and_tokenize(
 
     if model_type == "causal":
         tokenize_fn = _tokenize_causal_fn
-    elif model_type == "masked":
+    elif model_type in {"masked", "encoder-decoder"}:
         tokenize_fn = _tokenize_masked_fn
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
@@ -194,7 +204,10 @@ def chunk_and_tokenize(
     total_tokens: float = sum(data["length"])
 
     columns = ["input_ids"]
-    if model_type == "masked": #TODO: is this really required? or do models (e.g. ESM2) build its own attention amsk based on padding tokens?
+    if model_type in {
+        "masked",
+        "encoder-decoder",
+    }:  # TODO: is this really required? or do models (e.g. ESM2) build their own attention mask based on padding tokens?
         columns.append("attention_mask")
 
     return data.with_format(format, columns=columns), (

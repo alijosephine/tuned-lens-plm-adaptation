@@ -79,9 +79,35 @@ class Eval:
     mlm_probability: float = 0.15
     """Masking probability for masked-LM models."""
 
-    def _is_masked_model(self, _model: PreTrainedModel) -> bool:
-        """Return True only when masked mode is explicitly selected."""
-        return self.model.model_type == "masked"
+    def _prepare_batch_for_encoder_decoder_model(
+        self, batch: dict, model: PreTrainedModel
+    ) -> dict:
+        """Populate required decoder inputs for encoder-decoder models."""
+        if self.model.model_type != "encoder-decoder":
+            raise ValueError(
+                "Encoder-decoder batch preparation called for non-encoder-decoder model."
+            )
+        if "decoder_input_ids" not in batch:
+            if getattr(model.config, "decoder_start_token_id", None) is None:
+                raise ValueError(
+                    "Encoder-decoder models must set `decoder_start_token_id` in config."
+                )
+            shift_right = getattr(model, "_shift_right", None)
+            if shift_right is None:
+                raise ValueError("Encoder-decoder model is missing `_shift_right`.")
+            batch["decoder_input_ids"] = shift_right(batch["input_ids"])
+
+        if "decoder_attention_mask" not in batch:
+            pad_token_id = getattr(model.config, "pad_token_id", None)
+            if pad_token_id is None:
+                raise ValueError(
+                    "Encoder-decoder models must set `pad_token_id` in config."
+                )
+            batch["decoder_attention_mask"] = (
+                batch["decoder_input_ids"] != pad_token_id
+            ).long()
+
+        return batch
 
     @staticmethod
     def _masked_mean(x: th.Tensor, valid_mask: Optional[th.Tensor]) -> th.Tensor:
@@ -258,13 +284,16 @@ class Eval:
 
         assert model and tokenizer and data and lenses and nats_to_bpb
 
-        self._masked_model = self._is_masked_model(model)
-        if self._masked_model:
+        model_type = self.model.model_type
+        is_encoder_decoder_model = model_type == "encoder-decoder"
+        uses_masked_objective = model_type in {"masked", "encoder-decoder"}
+
+        if uses_masked_objective:
             mask_token_id = tokenizer.mask_token_id
             if mask_token_id is None:
                 raise ValueError(
                     f"Tokenizer '{tokenizer.__class__.__name__}' does not define a "
-                    "mask token, but model is configured as masked-LM."
+                    "mask token, but this model_type uses masked-token supervision."
                 )
             self._mask_token_id = int(mask_token_id)
             self._special_token_ids = list(tokenizer.all_special_ids)
@@ -313,7 +342,7 @@ class Eval:
         for batch in pbar:
             batch = self.dist.send_to_device(batch)
             ce_labels = batch["input_ids"]
-            if self._masked_model:
+            if uses_masked_objective:
                 masked_input_ids, ce_labels = mask_input_ids_for_mlm(
                     batch["input_ids"],
                     self._mask_token_id,
@@ -322,9 +351,20 @@ class Eval:
                 )
                 batch["input_ids"] = masked_input_ids
 
+            if is_encoder_decoder_model:
+                batch = self._prepare_batch_for_encoder_decoder_model(batch, model)
             output = model(**batch, output_hidden_states=True)
 
-            hidden_states = output.hidden_states[:-1]
+            if is_encoder_decoder_model:
+                if output.encoder_hidden_states is None:
+                    raise ValueError(
+                        "Expected `encoder_hidden_states` for encoder-decoder model output."
+                    )
+                hidden_states = output.encoder_hidden_states[:-1]
+            else:
+                if output.hidden_states is None:
+                    raise ValueError("Model output does not expose `hidden_states`.")
+                hidden_states = output.hidden_states[:-1]
 
             final_lps = output.logits.log_softmax(dim=-1)
 
@@ -333,10 +373,10 @@ class Eval:
 
             shift = self.token_shift
             if shift is None:
-                shift = 0 if self._masked_model else 1  # TODO: potentially mismatch between traina nd eval for KL loss in causal models!
+                shift = 0 if uses_masked_objective else 1 # TODO: potential mismatch between train and eval for KL loss in the case of causal models!
 
             labels = shift_labels(ce_labels, shift)
-            valid_mask = labels != -100 if self._masked_model else None
+            valid_mask = labels != -100 if uses_masked_objective else None
 
             batch_output = _nested_dict()
 
@@ -400,4 +440,4 @@ class Eval:
                 with (root_dir / "logit_stats.json").open("w") as f:
                     json.dump(logit_stats, f)
 
-# TODO: review eval script and shapes for maskd vs causal models (and shift = 0 or 2 or None)! for both ce loss and kl loss!
+# TODO: review eval script and shapes for maskd vs causal vs encoder-decoder models (and shift = 0 or 1 or 2 or None)! for both ce loss and kl loss!

@@ -141,9 +141,36 @@ class Train:
         if self.checkpoint_dir is None:
             self.checkpoint_dir = self.output / "checkpoints"
 
-    def _is_masked_model(self, _model: PreTrainedModel) -> bool:
-        """Return True only when masked mode is explicitly selected."""
-        return self.model.model_type == "masked"
+    def _prepare_batch_for_encoder_decoder_model(
+        self, batch: dict, model: Union[PreTrainedModel, FSDP]
+    ) -> dict:
+        """Populate required decoder inputs for encoder-decoder models."""
+        if self.model.model_type != "encoder-decoder":
+            raise ValueError(
+                "Encoder-decoder batch preparation called for non-encoder-decoder model."
+            )
+        wrapped = getattr(model, "module", model)
+        if "decoder_input_ids" not in batch:
+            if getattr(wrapped.config, "decoder_start_token_id", None) is None:
+                raise ValueError(
+                    "Encoder-decoder models must set `decoder_start_token_id` in config."
+                )
+            shift_right = getattr(wrapped, "_shift_right", None)
+            if shift_right is None:
+                raise ValueError("Encoder-decoder model is missing `_shift_right`.")
+            batch["decoder_input_ids"] = shift_right(batch["input_ids"])
+
+        if "decoder_attention_mask" not in batch:
+            pad_token_id = getattr(wrapped.config, "pad_token_id", None)
+            if pad_token_id is None:
+                raise ValueError(
+                    "Encoder-decoder models must set `pad_token_id` in config."
+                )
+            batch["decoder_attention_mask"] = (
+                batch["decoder_input_ids"] != pad_token_id
+            ).long()
+
+        return batch
 
     def get_lens(self, model: PreTrainedModel) -> TunedLens:
         """Load or create a TunedLens model."""
@@ -352,13 +379,12 @@ class Train:
 
         assert model and tokenizer and data and lens and nats_to_bpb
 
-        self._masked_model = self._is_masked_model(model)
-        if self._masked_model:
+        if self.model.model_type in {"masked", "encoder-decoder"}:
             mask_token_id = tokenizer.mask_token_id
             if mask_token_id is None:
                 raise ValueError(
                     f"Tokenizer '{tokenizer.__class__.__name__}' does not define a "
-                    "mask token, but model is configured as masked-LM."
+                    "mask token, but this model_type uses masked-token supervision."
                 )
             self._mask_token_id = int(mask_token_id)
             self._special_token_ids = list(tokenizer.all_special_ids)
@@ -434,10 +460,15 @@ class Train:
         # TODO this currently silently fails if the dataloader is exhausted
         for batch_idx, batch in zip(t, state.dataloader):
             assert isinstance(batch, dict), f"Expected dict, got {type(batch)}"
+            uses_masked_objective = self.model.model_type in {
+                "masked",
+                "encoder-decoder",
+            }
+            is_encoder_decoder_model = self.model.model_type == "encoder-decoder"
 
             batch = self.dist.send_to_device(batch)
             target_labels = batch["input_ids"]
-            if self._masked_model:
+            if uses_masked_objective:
                 masked_input_ids, target_labels = mask_input_ids_for_mlm(
                     batch["input_ids"],
                     self._mask_token_id,
@@ -446,27 +477,39 @@ class Train:
                 )
                 batch["input_ids"] = masked_input_ids
 
+            if is_encoder_decoder_model:
+                batch = self._prepare_batch_for_encoder_decoder_model(batch, model)
             with th.no_grad():
                 output = model(**batch, output_hidden_states=True)
 
             final_logits = output.logits
-            hidden_states = output.hidden_states[:-1]
+            if is_encoder_decoder_model:
+                if output.encoder_hidden_states is None:
+                    raise ValueError(
+                        "Expected `encoder_hidden_states` for encoder-decoder model output."
+                    )
+                hidden_states = output.encoder_hidden_states[:-1]
+            else:
+                if output.hidden_states is None:
+                    raise ValueError("Model output does not expose `hidden_states`.")
+                hidden_states = output.hidden_states[:-1]
 
             shift = self.token_shift
             if self.loss == LossChoice.CE:
                 labels = target_labels
 
                 # Predict the *current* token by default for masked-LMs and the
-                # *next* token by default for causal LMs.
+                # *next* token by default for causal LMs. Encoder-decoder models
+                # also use current-token alignment in this training setup.
                 if shift is None:
-                    shift = 0 if self._masked_model else 1
+                    shift = 0 if uses_masked_objective else 1
             elif self.loss == LossChoice.KL:
                 labels = final_logits.float().log_softmax(dim=-1)
 
                 # Match the *current* token distribution by default
                 if shift is None:
                     shift = 0  # unlike CE labels derived from input, shift not needed here!
-                if self._masked_model:
+                if uses_masked_objective:
                     shifted_target_labels = shift_labels(target_labels, shift)
                     valid_kl_mask = shifted_target_labels != -100
                 else:
@@ -485,7 +528,7 @@ class Train:
                     logits = shift_preds(state.lens(h, idx=i), shift)
 
                     if self.loss == LossChoice.CE:
-                        if self._masked_model and not (labels != -100).any().item():
+                        if uses_masked_objective and not (labels != -100).any().item():
                             # Keep the graph valid while contributing no gradient.
                             loss = logits.sum() * 0.0
                         else:
@@ -557,8 +600,13 @@ class Train:
         self, batch: dict, model: Union[PreTrainedModel, FSDP], lens: TunedLens
     ) -> dict[str, float]:
         """Validation-only forward pass returning per-translator scalar losses."""
+        uses_masked_objective = self.model.model_type in {
+            "masked",
+            "encoder-decoder",
+        }
+        is_encoder_decoder_model = self.model.model_type == "encoder-decoder"
         target_labels = batch["input_ids"]
-        if self._masked_model:
+        if uses_masked_objective:
             masked_input_ids, target_labels = mask_input_ids_for_mlm(
                 batch["input_ids"],
                 self._mask_token_id,
@@ -567,21 +615,32 @@ class Train:
             )
             batch["input_ids"] = masked_input_ids
 
+        if is_encoder_decoder_model:
+            batch = self._prepare_batch_for_encoder_decoder_model(batch, model)
         output = model(**batch, output_hidden_states=True)
         final_logits = output.logits
-        hidden_states = output.hidden_states[:-1]
+        if is_encoder_decoder_model:
+            if output.encoder_hidden_states is None:
+                raise ValueError(
+                    "Expected `encoder_hidden_states` for encoder-decoder model output."
+                )
+            hidden_states = output.encoder_hidden_states[:-1]
+        else:
+            if output.hidden_states is None:
+                raise ValueError("Model output does not expose `hidden_states`.")
+            hidden_states = output.hidden_states[:-1]
 
         shift = self.token_shift
         if self.loss == LossChoice.CE:
             labels = target_labels
             if shift is None:
-                shift = 0 if self._masked_model else 1
+                shift = 0 if uses_masked_objective else 1
             valid_kl_mask = None
         elif self.loss == LossChoice.KL:
             labels = final_logits.float().log_softmax(dim=-1)
             if shift is None:
                 shift = 0
-            if self._masked_model:
+            if uses_masked_objective:
                 shifted_target_labels = shift_labels(target_labels, shift)
                 valid_kl_mask = shifted_target_labels != -100
             else:
@@ -597,7 +656,7 @@ class Train:
                 logits = shift_preds(lens(h, idx=i), shift)
 
                 if self.loss == LossChoice.CE:
-                    if self._masked_model and not (labels != -100).any().item():
+                    if uses_masked_objective and not (labels != -100).any().item():
                         # Keep the graph valid while contributing no gradient.
                         loss = logits.sum() * 0.0
                     else:

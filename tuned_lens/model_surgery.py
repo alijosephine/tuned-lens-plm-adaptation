@@ -71,30 +71,101 @@ Norm = Union[
 ]
 
 
+def get_model_hidden_size_and_num_layers(model: tr.PreTrainedModel) -> tuple[int, int]:
+    """Infer model hidden size and layer count from config fields."""
+    d_model = getattr(model.config, "hidden_size", None)
+    if d_model is None:
+        d_model = getattr(model.config, "n_embd", None)
+    if d_model is None:
+        d_model = getattr(model.config, "d_model", None)
+    if d_model is None:
+        raise ValueError(
+            "Could not infer hidden size from model config. Expected one of "
+            "'hidden_size', 'n_embd', or 'd_model'."
+        )
+
+    num_hidden_layers = getattr(model.config, "num_hidden_layers", None)
+    if num_hidden_layers is None:
+        num_hidden_layers = getattr(model.config, "n_layer", None)
+    if num_hidden_layers is None:
+        num_hidden_layers = getattr(model.config, "num_layers", None)
+    if num_hidden_layers is None:
+        raise ValueError(
+            "Could not infer number of layers from model config. Expected one of "
+            "'num_hidden_layers', 'n_layer', or 'num_layers'."
+        )
+
+    return int(d_model), int(num_hidden_layers)
+
+
+# refer to run/example_configs_and_architectures folder for model types!!
+def _model_type(obj: Any) -> Union[str, None]:
+    """Return `config.model_type` when available."""
+    config = getattr(obj, "config", None)
+    model_type = getattr(config, "model_type", None)
+    return model_type if isinstance(model_type, str) else None
+
+
 def _is_progen_model(obj: Any) -> bool:
-    """Return True for known ProGen2 model class names."""
-    return type(obj).__name__ in {"ProGenForCausalLM", "ProGenModel"}
+    """Return True for ProGen2-family models."""
+    return _model_type(obj) == "progen"
 
 
 def _is_esm_model(obj: Any) -> bool:
-    """Return True for ESM/ESM2 base model classes."""
-    return type(obj).__name__ in {"EsmModel"}
+    """Return True for ESM/DPLM-family models."""
+    return _model_type(obj) == "esm"
+
+
+def _is_t5_model(obj: Any) -> bool:
+    """Return True for T5/ProtT5-family models."""
+    return _model_type(obj) == "t5"
+
+
+def _is_profluent_e1_model(obj: Any) -> bool:
+    """Return True for Profluent E1-family models."""
+    return _model_type(obj) == "E1"
 
 
 def get_unembedding_matrix(model: Model) -> nn.Linear:
     """The final linear tranformation from the model hidden state to the output."""
     if isinstance(model, tr.PreTrainedModel):
+        unembed = None
+        try:
+            unembed = model.get_output_embeddings()  # note - esm2 family should work with this!!
+        except Exception:
+            # Some custom wrappers may not expose output embeddings cleanly.
+            pass
+        if isinstance(unembed, nn.Linear):
+            return unembed
+
+        # NOTE: Disabled for now because not needed as per the output-embeddings probe test in tests/test_unembed.py.
+        # # T5/ProtT5 exposes output projection as `lm_head`.
+        # if _is_t5_model(model):
+        #     lm_head = getattr(model, "lm_head", None)
+        #     if isinstance(lm_head, nn.Linear):
+        #         return lm_head
+        #
+        # # Profluent E1 exposes output projection in `mlm_head`.
+        # if _is_profluent_e1_model(model):
+        #     mlm_head = getattr(model, "mlm_head", None)
+        #     if mlm_head is not None:
+        #         if isinstance(mlm_head, nn.Linear):
+        #             return mlm_head
+        #         raise ValueError(
+        #             "E1 `mlm_head` must be an `nn.Linear` for tuned-lens support."
+        #         )
+        # # TODO: for E1, may have to return the last linear layer as approximate??
+
         # ProGen2 exposes output projection as `lm_head`.
         if _is_progen_model(model):
             lm_head = getattr(model, "lm_head", None)
             if isinstance(lm_head, nn.Linear):
                 return lm_head
 
-        unembed = model.get_output_embeddings()
-        if isinstance(unembed, nn.Linear):
-            return unembed
-
-        raise ValueError("We currently only support models with a linear unembedding")
+        raise ValueError(
+            "Model output embedding head must be an `nn.Linear`, "
+            f"got {type(unembed)}."
+        )
     elif _transformer_lens_available and isinstance(model, tl.HookedTransformer):
         linear = nn.Linear(
             in_features=model.cfg.d_model,
@@ -120,7 +191,15 @@ def get_final_norm(model: Model) -> Norm:
         raise ValueError("Model does not have a `base_model` attribute.")
 
     base_model = model.base_model
-    if isinstance(base_model, models.opt.modeling_opt.OPTModel):
+    if _is_t5_model(base_model):
+        final_layer_norm = base_model.encoder.final_layer_norm
+    elif _is_profluent_e1_model(base_model):
+        final_layer_norm = base_model.norm
+    elif _is_esm_model(base_model): # should cover dplm as well!
+        final_layer_norm = base_model.encoder.emb_layer_norm_after
+    elif _is_progen_model(base_model):
+        final_layer_norm = base_model.ln_f
+    elif isinstance(base_model, models.opt.modeling_opt.OPTModel):
         final_layer_norm = base_model.decoder.final_layer_norm
     elif isinstance(base_model, models.gpt_neox.modeling_gpt_neox.GPTNeoXModel):
         final_layer_norm = base_model.final_layer_norm
@@ -140,10 +219,6 @@ def get_final_norm(model: Model) -> Norm:
         final_layer_norm = base_model.norm
     elif isinstance(base_model, models.gemma.modeling_gemma.GemmaModel):
         final_layer_norm = base_model.norm
-    elif _is_esm_model(base_model):
-        final_layer_norm = base_model.encoder.emb_layer_norm_after
-    elif _is_progen_model(base_model):
-        final_layer_norm = base_model.ln_f
     else:
         raise NotImplementedError(f"Unknown model type {type(base_model)}")
 
@@ -167,16 +242,28 @@ def get_transformer_layers(model: Model) -> tuple[str, th.nn.ModuleList]:
     Raises:
         ValueError: If no such list exists.
     """
-    # TODO implement this so that we can do hooked transformer training.
     if not hasattr(model, "base_model"):
         raise ValueError("Model does not have a `base_model` attribute.")
 
-    path_to_layers = ["base_model"]
     base_model = model.base_model
-    if isinstance(base_model, models.opt.modeling_opt.OPTModel):
-        path_to_layers += ["decoder", "layers"]
+    if _is_t5_model(base_model):
+        path_to_layers = "base_model.encoder.block"
+        layer_list = base_model.encoder.block
+    elif _is_profluent_e1_model(base_model):
+        path_to_layers = "base_model.layers"
+        layer_list = base_model.layers
+    elif _is_esm_model(base_model):
+        path_to_layers = "base_model.encoder.layer"
+        layer_list = base_model.encoder.layer
+    elif _is_progen_model(base_model):
+        path_to_layers = "base_model.h"
+        layer_list = base_model.h
+    elif isinstance(base_model, models.opt.modeling_opt.OPTModel):
+        path_to_layers = "base_model.decoder.layers"
+        layer_list = base_model.decoder.layers
     elif isinstance(base_model, models.gpt_neox.modeling_gpt_neox.GPTNeoXModel):
-        path_to_layers += ["layers"]
+        path_to_layers = "base_model.layers"
+        layer_list = base_model.layers
     elif isinstance(
         base_model,
         (
@@ -186,23 +273,21 @@ def get_transformer_layers(model: Model) -> tuple[str, th.nn.ModuleList]:
             models.gptj.modeling_gptj.GPTJModel,
         ),
     ):
-        path_to_layers += ["h"]
+        path_to_layers = "base_model.h"
+        layer_list = base_model.h
     elif isinstance(base_model, models.llama.modeling_llama.LlamaModel):
-        path_to_layers += ["layers"]
+        path_to_layers = "base_model.layers"
+        layer_list = base_model.layers
     elif isinstance(base_model, models.mistral.modeling_mistral.MistralModel):
-        path_to_layers += ["layers"]
+        path_to_layers = "base_model.layers"
+        layer_list = base_model.layers
     elif isinstance(base_model, models.gemma.modeling_gemma.GemmaModel):
-        path_to_layers += ["layers"]
-    elif _is_esm_model(base_model):
-        path_to_layers += ["encoder", "layer"]
-    elif _is_progen_model(base_model):
-        path_to_layers += ["h"]
+        path_to_layers = "base_model.layers"
+        layer_list = base_model.layers
     else:
         raise NotImplementedError(f"Unknown model type {type(base_model)}")
 
-    path_to_layers = ".".join(path_to_layers)
-    layer_list = get_key_path(model, path_to_layers)
-    if not isinstance(layer_list, th.nn.ModuleList):  # TODO: maybe this check not required!!
+    if not isinstance(layer_list, th.nn.ModuleList): # TODO: is this check required? revisit!
         raise ValueError(f"Expected ModuleList at '{path_to_layers}', got {type(layer_list)}")
     return path_to_layers, layer_list
 

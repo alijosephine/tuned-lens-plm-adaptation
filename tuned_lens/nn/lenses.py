@@ -12,6 +12,7 @@ import torch as th
 from transformers import PreTrainedModel
 
 from tuned_lens import load_artifacts
+from tuned_lens import model_surgery
 from tuned_lens.nn.unembed import Unembed
 
 logger = logging.getLogger(__name__)
@@ -193,30 +194,16 @@ class TunedLens(Lens):
         Returns:
             A TunedLens instance.
         """
-        d_model = getattr(model.config, "hidden_size", None)
-        if d_model is None:
-            d_model = getattr(model.config, "n_embd", None)
-        if d_model is None:
-            raise ValueError(
-                "Could not infer hidden size from model config. Expected one of "
-                "'hidden_size' or 'n_embd'."
-            )
-
-        num_hidden_layers = getattr(model.config, "num_hidden_layers", None)
-        if num_hidden_layers is None:
-            num_hidden_layers = getattr(model.config, "n_layer", None)
-        if num_hidden_layers is None:
-            raise ValueError(
-                "Could not infer number of layers from model config. Expected one of "
-                "'num_hidden_layers' or 'n_layer'."
-            )
+        d_model, num_hidden_layers = model_surgery.get_model_hidden_size_and_num_layers(
+            model
+        )
 
         unembed = Unembed(model)
         config = TunedLensConfig(
             base_model_name_or_path=model.config.name_or_path,
             base_model_revision=model_revision,
-            d_model=int(d_model),
-            num_hidden_layers=int(num_hidden_layers),
+            d_model=d_model,
+            num_hidden_layers=num_hidden_layers,
             bias=bias,
         )
 

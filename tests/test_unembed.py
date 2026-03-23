@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch as th
 import transformers as tr
 
@@ -29,3 +31,52 @@ def test_correctness(random_small_model: tr.PreTrainedModel):
 
     x_hat = back_translate(unembed, x, tol=1e-5)
     th.testing.assert_close(y.exp(), unembed(x_hat).softmax(-1), atol=5e-4, rtol=0.01)
+
+
+def test_output_embeddings_for_selected_protein_models():
+    """Manual probe: load selected protein models and print output embedding modules."""
+    model_specs = [
+        ("esm2", "facebook/esm2_t6_8M_UR50D", tr.AutoModelForMaskedLM, {}),
+        ("prott5", "Rostlab/prot_t5_xl_uniref50", tr.AutoModelForSeq2SeqLM, {}),
+        (
+            "progen2",
+            "hugohrban/progen2-small",
+            tr.AutoModelForCausalLM,
+            {"trust_remote_code": True},
+        ),
+        (
+            "e1",
+            "Profluent-Bio/E1-150m",
+            tr.AutoModelForMaskedLM,
+            {"trust_remote_code": True},
+        ),
+        (
+            "dplm",
+            "airkingbd/dplm_150m",
+            tr.AutoModelForMaskedLM,
+            {"trust_remote_code": True},
+        ),
+    ]
+
+    failures: list[str] = []
+    for family, model_id, model_cls, extra_kwargs in model_specs:
+        model: Optional[tr.PreTrainedModel] = None
+        try:
+            model = model_cls.from_pretrained(
+                model_id,
+                low_cpu_mem_usage=True,
+                **extra_kwargs,
+            )
+            out_embed = model.get_output_embeddings()
+            print(
+                f"[{family}] {model_id} -> output_embeddings={type(out_embed).__name__} "
+                f"linear={isinstance(out_embed, th.nn.Linear)}"
+            )
+        except Exception as exc:
+            msg = f"[{family}] {model_id} -> ERROR: {type(exc).__name__}: {exc}"
+            print(msg)
+            failures.append(msg)
+        finally:
+            del model
+
+    assert not failures, "Some model probes failed:\n" + "\n".join(failures)
