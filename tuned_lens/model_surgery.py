@@ -132,6 +132,7 @@ def get_unembedding_matrix(model: Model) -> nn.Linear:
         unembed = None
         try:
             unembed = model.get_output_embeddings()  # note - esm2 family should work with this!!
+                                                     # TODO: but, rethink if esm2 lm_head to be extracted and used or the linear layer retunred by model.get_output_embeddings()
         except Exception:
             # Some custom wrappers may not expose output embeddings cleanly.
             pass

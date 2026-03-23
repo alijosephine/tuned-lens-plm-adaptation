@@ -21,12 +21,14 @@ from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchdata import dataloader2, datapipes
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForMaskedLM,
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     PreTrainedModel,
     PreTrainedTokenizerBase,
+    T5Tokenizer,
     get_linear_schedule_with_warmup,
 )
 from typing_extensions import Literal
@@ -154,14 +156,23 @@ class Model:
     def load_tokenizer(self, must_use_cache: bool = False) -> PreTrainedTokenizerBase:
         """Load the tokenizer from huggingface hub."""
         with handle_name_conflicts():
-            tokenizer = AutoTokenizer.from_pretrained(
-                self.tokenizer or self.name,
-                revision=self.revision,
-                use_fast=not self.slow_tokenizer,
-                tokenizer_type=self.tokenizer_type,
-                local_files_only=must_use_cache,
-                trust_remote_code=self.trust_remote_code,
-            )
+            # T5TokenizerFast in newer transformers incorrectly tries to parse spiece.model
+            # as a tiktoken file. Use T5Tokenizer (slow/SentencePiece) directly for T5 models.
+            if self.model_type == "encoder-decoder":
+                tokenizer = T5Tokenizer.from_pretrained(
+                    self.tokenizer or self.name,
+                    revision=self.revision,
+                    local_files_only=must_use_cache,
+                )
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    self.tokenizer or self.name,
+                    revision=self.revision,
+                    use_fast=not self.slow_tokenizer,
+                    tokenizer_type=self.tokenizer_type,
+                    local_files_only=must_use_cache,
+                    trust_remote_code=self.trust_remote_code,
+                )
 
         assert isinstance(tokenizer, PreTrainedTokenizerBase)
 
@@ -223,6 +234,10 @@ class Model:
             auto_model_cls = AutoModelForSeq2SeqLM
         else:
             raise ValueError(f"Unknown model_type: {self.model_type}")
+
+        # TODO: E1 from huggingface not supported yet!
+        # so, use local installation of E1 just as done in depth_analysis
+        # code changes for the same in tunedlens is pending!! not straight-forard due to version mismatches in dependencies!!
 
         with handle_name_conflicts():
             model = auto_model_cls.from_pretrained(  # type: ignore

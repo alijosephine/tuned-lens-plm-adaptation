@@ -373,7 +373,7 @@ class Eval:
 
             shift = self.token_shift
             if shift is None:
-                shift = 0 if uses_masked_objective else 1 # TODO: potential mismatch between train and eval for KL loss in the case of causal models!
+                shift = 0 if uses_masked_objective else 1 # used only on ce loss.
 
             labels = shift_labels(ce_labels, shift)
             valid_mask = labels != -100 if uses_masked_objective else None
@@ -439,5 +439,3 @@ class Eval:
             if self.record_logit_stats:
                 with (root_dir / "logit_stats.json").open("w") as f:
                     json.dump(logit_stats, f)
-
-# TODO: review eval script and shapes for maskd vs causal vs encoder-decoder models (and shift = 0 or 1 or 2 or None)! for both ce loss and kl loss!
