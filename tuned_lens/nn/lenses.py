@@ -154,8 +154,10 @@ class TunedLens(Lens):
         unembed_hash = unembed.unembedding_hash()
         config.unembed_hash = unembed_hash
 
-        # The unembedding might be int8 if we're using bitsandbytes
-        w = unembed.unembedding.weight
+        # The unembedding might be int8 if we're using bitsandbytes.
+        # Use the first parameter of whatever module is stored (works for both
+        # plain nn.Linear and composite non-linear heads).
+        w = next(unembed.unembedding.parameters())
         dtype = w.dtype if th.is_floating_point(w) else th.float16
 
         translator = th.nn.Linear(

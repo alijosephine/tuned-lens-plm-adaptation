@@ -31,9 +31,13 @@ class InversionOutput:
 
 class Unembed(th.nn.Module):
     """Module that maps transformer hidden states to logits (and vice versa)."""
+    # NOTE: previosuly, this only covered linear unembeddings. 
+    # Now, it covers composite non-linear heads as well (e.g. ESM2's `EsmLMHead`).
+    # But the inclusion of non-linear unembeding is limited to training tuned lenses for protein langauge models!!
+    # The invert function of subspace analysis or any functionality outside of tuning lenses will not work for non-linear unmebedings!!
 
     final_norm: model_surgery.Norm
-    unembedding: th.nn.Linear
+    unembedding: th.nn.Module
 
     def __init__(
         self,
@@ -55,9 +59,17 @@ class Unembed(th.nn.Module):
         self.requires_grad_(False)
 
     def unembedding_hash(self) -> str:
-        """Hash the unmbedding matrix to identify the model."""
-        parameter = self.unembedding.weight.data.detach().cpu().float().numpy()
-        return tensor_hash(parameter)
+        """Hash the unembedding module parameters to identify the model.
+
+        Works for both plain ``nn.Linear`` heads and composite non-linear heads
+        (e.g. ESM2's ``EsmLMHead``).
+        """
+        import numpy as np
+        params = np.concatenate(
+            [p.data.detach().cpu().float().numpy().ravel()
+             for p in self.unembedding.parameters()]
+        )
+        return tensor_hash(params)
 
     def forward(self, h: th.Tensor) -> th.Tensor:
         """Convert hidden states into logits."""

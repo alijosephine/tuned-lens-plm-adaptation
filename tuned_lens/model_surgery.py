@@ -126,46 +126,65 @@ def _is_profluent_e1_model(obj: Any) -> bool:
     return _model_type(obj) == "E1"
 
 
-def get_unembedding_matrix(model: Model) -> nn.Linear:
-    """The final linear tranformation from the model hidden state to the output."""
+def get_unembedding_matrix(model: Model) -> nn.Module:
+    """The final transformation from the model hidden state to the output logits.
+
+    For models with a simple linear head this returns an ``nn.Linear``.  For
+    models whose head is a composite module (e.g. ESM2's ``EsmLMHead`` which
+    contains ``dense → layer_norm → decoder``), the full module is returned so
+    that the complete unembedding path is used when computing distributions.
+    """
     if isinstance(model, tr.PreTrainedModel):
+        # ESM/DPLM: lm_head is EsmLMHead (dense + layer_norm + decoder).
+        # get_output_embeddings() only returns the inner decoder Linear, losing
+        # the dense projection and layer norm.  Return the full lm_head instead.
+        if _is_esm_model(model):
+            lm_head = getattr(model, "lm_head", None)
+            if lm_head is not None and isinstance(lm_head, nn.Module):
+                return lm_head
+            raise ValueError("error in extracting lm_head from ESM model")
+
+        # T5/ProtT5: lm_head is a plain Linear(d_model, vocab, bias=False).
+        if _is_t5_model(model):
+            lm_head = getattr(model, "lm_head", None)
+            if lm_head is not None and isinstance(lm_head, nn.Linear):
+                return lm_head
+            raise ValueError(
+                f"error in extracting lm_head from T5 model"
+            )
+
+        # E1: mlm_head is Sequential(Linear → GELU → LayerNorm → Linear).
+        if _is_profluent_e1_model(model):
+            mlm_head = getattr(model, "mlm_head", None)
+            if mlm_head is not None and isinstance(mlm_head, nn.Sequential):
+                return mlm_head
+            raise ValueError(
+                f"error in extracting lm_head from E1 model"
+            )
+
+        # ProGen2: lm_head is a plain Linear(d_model, vocab, bias=True).
+        if _is_progen_model(model):
+            lm_head = getattr(model, "lm_head", None)
+            if lm_head is not None and isinstance(lm_head, nn.Linear):
+                return lm_head
+            raise ValueError(
+                f"error in extracting lm_head from ProGen2 model"
+            )
+
+        # Default path for all standard HuggingFace causal/masked LMs
+        # (GPT-2, LLaMA, Mistral, Gemma, OPT, Bloom, GPT-NeoX, …):
+        # get_output_embeddings() returns the lm_head directly as nn.Linear.
         unembed = None
         try:
-            unembed = model.get_output_embeddings()  # note - esm2 family should work with this!!
-                                                     # TODO: but, rethink if esm2 lm_head to be extracted and used or the linear layer retunred by model.get_output_embeddings()
+            unembed = model.get_output_embeddings()
         except Exception:
-            # Some custom wrappers may not expose output embeddings cleanly.
             pass
         if isinstance(unembed, nn.Linear):
             return unembed
 
-        # NOTE: Disabled for now because not needed as per the output-embeddings probe test in tests/test_unembed.py.
-        # # T5/ProtT5 exposes output projection as `lm_head`.
-        # if _is_t5_model(model):
-        #     lm_head = getattr(model, "lm_head", None)
-        #     if isinstance(lm_head, nn.Linear):
-        #         return lm_head
-        #
-        # # Profluent E1 exposes output projection in `mlm_head`.
-        # if _is_profluent_e1_model(model):
-        #     mlm_head = getattr(model, "mlm_head", None)
-        #     if mlm_head is not None:
-        #         if isinstance(mlm_head, nn.Linear):
-        #             return mlm_head
-        #         raise ValueError(
-        #             "E1 `mlm_head` must be an `nn.Linear` for tuned-lens support."
-        #         )
-        # # TODO: for E1, may have to return the last linear layer as approximate??
-
-        # ProGen2 exposes output projection as `lm_head`.
-        if _is_progen_model(model):
-            lm_head = getattr(model, "lm_head", None)
-            if isinstance(lm_head, nn.Linear):
-                return lm_head
-
         raise ValueError(
-            "Model output embedding head must be an `nn.Linear`, "
-            f"got {type(unembed)}."
+            f"Could not find a supported unembedding module for model type "
+            f"'{_model_type(model)}' (got {type(unembed)} from get_output_embeddings)."
         )
     elif _transformer_lens_available and isinstance(model, tl.HookedTransformer):
         linear = nn.Linear(
