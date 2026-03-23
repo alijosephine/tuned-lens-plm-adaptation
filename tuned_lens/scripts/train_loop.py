@@ -132,6 +132,10 @@ class Train:
     mlm_probability: float = 0.15
     """Masking probability for masked-LM models."""
 
+    val_freq: int = 0
+    """Validate every N optimizer steps using a held-out 10% split.
+    Set to 0 to disable validation."""
+
     def __post_init__(self):
         """Set defaults for some fields."""
         if self.checkpoint_dir is None:
@@ -359,6 +363,15 @@ class Train:
             self._mask_token_id = int(mask_token_id)
             self._special_token_ids = list(tokenizer.all_special_ids)
 
+        self._val_dataset = None
+        if self.val_freq > 0:
+            split = data.train_test_split(test_size=0.1, seed=self.seed)
+            data = split["train"]
+            self._val_dataset = split["test"]
+            logger.info(
+                f"Data split: {len(data)} train / {len(self._val_dataset)} val samples"
+            )
+
         logger.debug(f"Creating data loader and setting seed to {self.seed} ...")
         dl = self.dist.dataloader(data)
         dl.seed(self.seed)
@@ -472,11 +485,15 @@ class Train:
                     logits = shift_preds(state.lens(h, idx=i), shift)
 
                     if self.loss == LossChoice.CE:
-                        loss = th.nn.functional.cross_entropy(
-                            logits.flatten(0, -2),
-                            labels.flatten(),
-                            ignore_index=-100,
-                        )
+                        if self._masked_model and not (labels != -100).any().item():
+                            # Keep the graph valid while contributing no gradient.
+                            loss = logits.sum() * 0.0
+                        else:
+                            loss = th.nn.functional.cross_entropy(
+                                logits.flatten(0, -2),
+                                labels.flatten(),
+                                ignore_index=-100,
+                            )
                     elif self.loss == LossChoice.KL:
                         token_kl = th.sum(
                             labels.exp() * (labels - logits.log_softmax(-1)), dim=-1
@@ -496,6 +513,7 @@ class Train:
                         raise NotImplementedError
 
                     logging_loss = loss.detach()
+                    # TODO: should the reduce across ranks be weighted  by number of masked tokens?!
                     logging_loss = maybe_all_reduce(logging_loss).item()
                     if self.dist.primary:
                         losses[f"translator_{i}"].append(logging_loss)
@@ -516,6 +534,8 @@ class Train:
                 self._log(state.opt, step, losses, lens, state.nats_to_bpb)
                 losses.clear()
                 state.step = step + 1
+                if self.val_freq > 0 and state.step % self.val_freq == 0:
+                    self._validate(model, state)
                 if (
                     self.checkpoint_freq
                     and step % self.checkpoint_freq == self.checkpoint_freq - 1
@@ -528,3 +548,125 @@ class Train:
             # Unwrap the lens from DDP if needed
             lens = getattr(state.lens, "module", state.lens)
             lens.save(self.output)
+
+    ######### additions for validation loss #######
+    # same computations as train step, repeated for validation
+
+    @th.no_grad()
+    def _compute_batch_losses_for_validation(
+        self, batch: dict, model: Union[PreTrainedModel, FSDP], lens: TunedLens
+    ) -> dict[str, float]:
+        """Validation-only forward pass returning per-translator scalar losses."""
+        target_labels = batch["input_ids"]
+        if self._masked_model:
+            masked_input_ids, target_labels = mask_input_ids_for_mlm(
+                batch["input_ids"],
+                self._mask_token_id,
+                self._special_token_ids,
+                self.mlm_probability,
+            )
+            batch["input_ids"] = masked_input_ids
+
+        output = model(**batch, output_hidden_states=True)
+        final_logits = output.logits
+        hidden_states = output.hidden_states[:-1]
+
+        shift = self.token_shift
+        if self.loss == LossChoice.CE:
+            labels = target_labels
+            if shift is None:
+                shift = 0 if self._masked_model else 1
+            valid_kl_mask = None
+        elif self.loss == LossChoice.KL:
+            labels = final_logits.float().log_softmax(dim=-1)
+            if shift is None:
+                shift = 0
+            if self._masked_model:
+                shifted_target_labels = shift_labels(target_labels, shift)
+                valid_kl_mask = shifted_target_labels != -100
+            else:
+                valid_kl_mask = None
+        else:
+            raise NotImplementedError(f"Unknown loss {self.loss}")
+
+        labels = shift_labels(labels, shift)
+        has_valid_ce_targets = bool((labels != -100).any().item())
+
+        result = {}
+        for i, h in enumerate(hidden_states):
+            with th.autocast(self.dist.device.type, dtype=th.bfloat16):
+                logits = shift_preds(lens(h, idx=i), shift)
+
+                if self.loss == LossChoice.CE:
+                    if self._masked_model and not has_valid_ce_targets:
+                        # Keep the graph valid while contributing no gradient.
+                        loss = logits.sum() * 0.0
+                    else:
+                        loss = th.nn.functional.cross_entropy(
+                            logits.flatten(0, -2),
+                            labels.flatten(),
+                            ignore_index=-100,
+                        )
+                elif self.loss == LossChoice.KL:
+                    token_kl = th.sum(
+                        labels.exp() * (labels - logits.log_softmax(-1)), dim=-1
+                    )
+                    if valid_kl_mask is None:
+                        loss = token_kl.mean()
+                    else:
+                        valid_count = valid_kl_mask.sum()
+                        if valid_count.item() == 0:
+                            # Keep the graph valid while contributing no gradient.
+                            loss = token_kl.sum() * 0.0
+                        else:
+                            loss = (
+                                token_kl * valid_kl_mask.to(token_kl.dtype)
+                            ).sum() / valid_count.to(token_kl.dtype)
+                else:
+                    raise NotImplementedError
+
+                logging_loss = maybe_all_reduce(loss.detach()).item()
+                if self.dist.primary:
+                    result[f"translator_{i}"] = logging_loss
+
+        return result
+
+    def _validate(self, model: Union[PreTrainedModel, FSDP], state: State) -> None:
+        """Run validation on the held-out split and log to Weights & Biases."""
+        if self._val_dataset is None:
+            return
+
+        lens = getattr(state.lens, "module", state.lens)
+        was_training = lens.training
+        lens.eval()
+
+        val_loader = self.dist.dataloader(self._val_dataset)
+        val_loader.seed(self.seed)
+        val_losses: dict[str, list[float]] = defaultdict(list)
+
+        try:
+            for batch in val_loader:
+                assert isinstance(batch, dict), f"Expected dict, got {type(batch)}"
+                batch = self.dist.send_to_device(batch)
+                for k, v in self._compute_batch_losses_for_validation(
+                    batch, model, lens
+                ).items():
+                    if self.dist.primary:
+                        val_losses[k].append(v)
+        finally:
+            lens.train(was_training)
+
+        if self.dist.primary and val_losses:
+            metrics = {
+                f"val_loss/{k}": th.tensor(v).mean() * state.nats_to_bpb
+                for k, v in val_losses.items()
+            }
+            if self.wandb:
+                import wandb
+
+                wandb.log(metrics, step=state.step)
+            else:
+                metrics_str = ", ".join(
+                    f"{k}={float(v):.6f}" for k, v in metrics.items()
+                )
+                logger.info(f"Validation step {state.step}: {metrics_str}")

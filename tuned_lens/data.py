@@ -62,6 +62,10 @@ def chunk_and_tokenize(
 
     For `model_type="causal"`, this performs GPT-style concatenation/chunking: short
     sequences are merged with EOS separators and then split into fixed windows.
+    The resulting dataset will consist entirely of chunks exactly `max_seq_len` tokens
+    long. Long sequences will be split into multiple chunks, and short sequences will
+    be merged with their neighbors, using `eos_token` as a separator. The fist token
+    will also always be an `eos_token`.
 
     For `model_type="masked"`, each sequence is tokenized independently and padded to
     `max_seq_len` so sample boundaries are preserved. (else attention across boundarie smight be an issue!)
