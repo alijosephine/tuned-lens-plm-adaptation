@@ -590,7 +590,6 @@ class Train:
             raise NotImplementedError(f"Unknown loss {self.loss}")
 
         labels = shift_labels(labels, shift)
-        has_valid_ce_targets = bool((labels != -100).any().item())
 
         result = {}
         for i, h in enumerate(hidden_states):
@@ -598,7 +597,7 @@ class Train:
                 logits = shift_preds(lens(h, idx=i), shift)
 
                 if self.loss == LossChoice.CE:
-                    if self._masked_model and not has_valid_ce_targets:
+                    if self._masked_model and not (labels != -100).any().item():
                         # Keep the graph valid while contributing no gradient.
                         loss = logits.sum() * 0.0
                     else:
