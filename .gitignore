@@ -141,6 +141,7 @@ dmypy.json
 
 # pLM adaptations:
 .vscode/
+.claude/
 notes_for_local_tunedlens.txt
 notes_for_plm_depth_analysis.txt
 data/*

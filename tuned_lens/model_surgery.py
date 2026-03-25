@@ -79,9 +79,11 @@ def get_model_hidden_size_and_num_layers(model: tr.PreTrainedModel) -> tuple[int
     if d_model is None:
         d_model = getattr(model.config, "d_model", None)
     if d_model is None:
+        d_model = getattr(model.config, "embed_dim", None)
+    if d_model is None:
         raise ValueError(
             "Could not infer hidden size from model config. Expected one of "
-            "'hidden_size', 'n_embd', or 'd_model'."
+            "'hidden_size', 'n_embd', 'd_model', or 'embed_dim'."
         )
 
     num_hidden_layers = getattr(model.config, "num_hidden_layers", None)

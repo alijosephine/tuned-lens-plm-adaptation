@@ -410,6 +410,10 @@ class Distributed:
             logger.info(
                 f"Using '{layer_cls.__name__}' for transformer_auto_wrap_policy."
             )
+            # Some models (e.g. T5-XXL) load with mixed float16/float32 params
+            # even when torch_dtype=float16 is requested. FSDP requires uniform
+            # dtype across all tensors in a module, so force-cast here.
+            model = model.to(th.float16)
             return FullyShardedDataParallel(
                 model,
                 auto_wrap_policy=partial(
