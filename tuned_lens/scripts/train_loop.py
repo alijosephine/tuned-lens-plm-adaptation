@@ -389,6 +389,12 @@ class Train:
             self._mask_token_id = int(mask_token_id)
             self._special_token_ids = list(tokenizer.all_special_ids)
 
+        self._pad_token_id = (
+            int(tokenizer.pad_token_id)
+            if tokenizer.pad_token_id is not None
+            else None
+        )
+
         self._val_dataset = None
         if self.val_freq > 0:
             split = data.train_test_split(test_size=0.1, seed=self.seed)
@@ -512,12 +518,19 @@ class Train:
                 if uses_masked_objective:
                     shifted_target_labels = shift_labels(target_labels, shift)
                     valid_kl_mask = shifted_target_labels != -100
+                elif self._pad_token_id is not None:
+                    valid_kl_mask = batch["input_ids"] != self._pad_token_id
                 else:
                     valid_kl_mask = None
             else:
                 raise NotImplementedError(f"Unknown loss {self.loss}")
 
             labels = shift_labels(labels, shift)
+            if self.loss == LossChoice.CE and self._pad_token_id is not None:
+                # Mask out positions where the shifted label is a pad token so they
+                # are excluded from CE loss (cross_entropy ignores index -100).
+                # For masked models this is a no-op: pad labels are already -100.
+                labels = labels.masked_fill(labels == self._pad_token_id, -100)
 
             # We do this sequentially to save VRAM
             for i, h in enumerate(hidden_states):
@@ -643,12 +656,16 @@ class Train:
             if uses_masked_objective:
                 shifted_target_labels = shift_labels(target_labels, shift)
                 valid_kl_mask = shifted_target_labels != -100
+            elif self._pad_token_id is not None:
+                valid_kl_mask = batch["input_ids"] != self._pad_token_id
             else:
                 valid_kl_mask = None
         else:
             raise NotImplementedError(f"Unknown loss {self.loss}")
 
         labels = shift_labels(labels, shift)
+        if self.loss == LossChoice.CE and self._pad_token_id is not None:
+            labels = labels.masked_fill(labels == self._pad_token_id, -100)
 
         result = {}
         for i, h in enumerate(hidden_states):

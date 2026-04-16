@@ -96,7 +96,7 @@ def chunk_and_tokenize(
             section 3.1.
     """
 
-    def _tokenize_causal_fn(x: dict[str, list]):
+    def _tokenize_concat_fn(x: dict[str, list]):
         chunk_size = min(tokenizer.model_max_length, max_seq_len)
         sep = tokenizer.eos_token or "<|endoftext|>"
         joined_text = sep.join([""] + x[text_key])
@@ -148,7 +148,7 @@ def chunk_and_tokenize(
 
         return output
 
-    def _tokenize_masked_fn(x: dict[str, list]):
+    def _tokenize_perseq_fn(x: dict[str, list]):
         if tokenizer.pad_token_id is None:
             raise ValueError(
                 "Masked tokenization requires a tokenizer with `pad_token_id`."
@@ -182,10 +182,14 @@ def chunk_and_tokenize(
 
         return output
 
-    if model_type == "causal":
-        tokenize_fn = _tokenize_causal_fn
+    if type(tokenizer).__name__ == "ProGen3TokenizerWrapper":
+        # ProGen3 is causal but requires per-sequence position_ids/sequence_ids —
+        # window-chunking across sequence boundaries would corrupt those tensors.
+        tokenize_fn = _tokenize_perseq_fn
+    elif model_type == "causal":
+        tokenize_fn = _tokenize_concat_fn
     elif model_type in {"masked", "encoder-decoder"}:
-        tokenize_fn = _tokenize_masked_fn
+        tokenize_fn = _tokenize_perseq_fn
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -204,12 +208,15 @@ def chunk_and_tokenize(
     total_tokens: float = sum(data["length"])
 
     columns = ["input_ids"]
-    if model_type in {
+    if type(tokenizer).__name__ == "E1TokenizerWrapper":
+        columns += ["sequence_ids", "within_seq_position_ids", "global_position_ids"]
+    elif type(tokenizer).__name__ == "ProGen3TokenizerWrapper":
+        columns += ["position_ids", "sequence_ids"]
+    elif model_type in {
         "masked",
         "encoder-decoder",
     }:  # TODO: is this really required? or do models (e.g. ESM2) build their own attention mask based on padding tokens?
         columns.append("attention_mask")
-
     return data.with_format(format, columns=columns), (
         total_tokens / total_bytes
     ) / math.log(2)

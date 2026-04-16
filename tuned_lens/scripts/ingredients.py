@@ -38,6 +38,7 @@ from tuned_lens.data import (
     dataset_from_fasta,
 )
 from tuned_lens.model_surgery import get_transformer_layers
+from tuned_lens.model_wrappers import E1TokenizerWrapper, ProGen3TokenizerWrapper
 from tuned_lens.nn.lenses import Lens
 from tuned_lens.utils import (
     TreeType,
@@ -118,7 +119,7 @@ class Data:
 
         return processed, nats_to_bpb
 
-
+#TODO: for E1 and ProGen3, i.e. profluent models, adapat the model loading (and maybe the tokenizer)!
 @dataclass
 class Model:
     """Configuration for the model and tokenizer."""
@@ -153,8 +154,26 @@ class Model:
     - "encoder-decoder": use AutoModelForSeq2SeqLM (e.g. ProtT5).
     """
 
-    def load_tokenizer(self, must_use_cache: bool = False) -> PreTrainedTokenizerBase:
-        """Load the tokenizer from huggingface hub."""
+    model_loader: Literal["huggingface", "e1", "progen3"] = "huggingface"
+    """Which loading backend to use.
+
+    - "huggingface": standard HuggingFace Auto* classes (default).
+    - "e1": Profluent E1 local installation.
+    - "progen3": Profluent ProGen3 local installation.
+    """
+
+    def load_tokenizer(self, must_use_cache: bool = False):
+        """Load the tokenizer.
+
+        Returns a PreTrainedTokenizerBase for HuggingFace models, or an
+        E1TokenizerWrapper for E1 (see tuned_lens/model_wrappers.py).
+        """
+        if self.model_loader == "e1":
+            return E1TokenizerWrapper()
+
+        if self.model_loader == "progen3":
+            return ProGen3TokenizerWrapper()
+
         with handle_name_conflicts():
             # T5TokenizerFast in newer transformers incorrectly tries to parse spiece.model
             # as a tiktoken file. Use T5Tokenizer (slow/SentencePiece) directly for T5 models.
@@ -179,7 +198,7 @@ class Model:
         # ProtT5 tokenizers do not define `mask_token` by default, but expose
         # sentinel extra ids. Reuse <extra_id_0> for MLM masking.
         if (
-            self.model_type in {"masked", "encoder-decoder"}
+            self.model_type == "encoder-decoder"
             and tokenizer.mask_token_id is None
         ):
             sentinel = "<extra_id_0>"
@@ -226,31 +245,50 @@ class Model:
         except KeyError as e:
             raise ValueError(f"Unknown precision: {self.precision}") from e
 
-        if self.model_type == "causal":
-            auto_model_cls = AutoModelForCausalLM
-        elif self.model_type == "masked":
-            auto_model_cls = AutoModelForMaskedLM
-        elif self.model_type == "encoder-decoder":
-            auto_model_cls = AutoModelForSeq2SeqLM
-        else:
-            raise ValueError(f"Unknown model_type: {self.model_type}")
+        if self.model_loader == "e1":
+            from E1.modeling import E1ForMaskedLM
+            with handle_name_conflicts():
+                model = E1ForMaskedLM.from_pretrained(
+                    self.name,
+                    device_map={"": device} if device is not None else None,
+                    low_cpu_mem_usage=True,
+                    torch_dtype=dtype,
+                    local_files_only=must_use_cache,
+                )
+            logger.info("Loaded E1 model via local E1 package.")
+        elif self.model_loader == "progen3":
+            from progen3.modeling import ProGen3ForCausalLM
+            with handle_name_conflicts():
+                model = ProGen3ForCausalLM.from_pretrained(
+                    self.name,
+                    device_map={"": device} if device is not None else None,
+                    low_cpu_mem_usage=True,
+                    torch_dtype=dtype,
+                    local_files_only=must_use_cache,
+                )
+            logger.info("Loaded ProGen3 model via local progen3 package.")
+        else: #default: huggingface
+            if self.model_type == "causal":
+                auto_model_cls = AutoModelForCausalLM
+            elif self.model_type == "masked":
+                auto_model_cls = AutoModelForMaskedLM
+            elif self.model_type == "encoder-decoder":
+                auto_model_cls = AutoModelForSeq2SeqLM
+            else:
+                raise ValueError(f"Unknown model_type: {self.model_type}")
 
-        # TODO: E1 from huggingface not supported yet!
-        # so, use local installation of E1 just as done in depth_analysis
-        # code changes for the same in tunedlens is pending!! not straight-forard due to version mismatches in dependencies!!
-
-        with handle_name_conflicts():
-            model = auto_model_cls.from_pretrained(  # type: ignore
-                self.name,
-                device_map={"": device} if device is not None else None,
-                load_in_8bit=self.precision == "int8",
-                low_cpu_mem_usage=True,
-                revision=self.revision,
-                torch_dtype=dtype,
-                local_files_only=must_use_cache,
-                trust_remote_code=self.trust_remote_code,
-            )
-        logger.info(f"Loaded model using '{self.model_type}' head.")
+            with handle_name_conflicts():
+                model = auto_model_cls.from_pretrained(  # type: ignore
+                    self.name,
+                    device_map={"": device} if device is not None else None,
+                    load_in_8bit=self.precision == "int8",
+                    low_cpu_mem_usage=True,
+                    revision=self.revision,
+                    torch_dtype=dtype,
+                    local_files_only=must_use_cache,
+                    trust_remote_code=self.trust_remote_code,
+                )
+            logger.info(f"Loaded model using '{self.model_type}' head.")
 
         assert isinstance(model, PreTrainedModel)
         model.eval()

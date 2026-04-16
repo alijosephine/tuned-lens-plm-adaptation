@@ -108,9 +108,9 @@ def _model_type(obj: Any) -> Union[str, None]:
     return model_type if isinstance(model_type, str) else None
 
 
-def _is_progen_model(obj: Any) -> bool:
+def _is_progen2_model(obj: Any) -> bool:
     """Return True for ProGen2-family models."""
-    return _model_type(obj) == "progen"
+    return _model_type(obj) == "progen2"
 
 
 def _is_esm_model(obj: Any) -> bool:
@@ -123,9 +123,14 @@ def _is_t5_model(obj: Any) -> bool:
     return _model_type(obj) == "t5"
 
 
-def _is_profluent_e1_model(obj: Any) -> bool:
+def _is_e1_model(obj: Any) -> bool:
     """Return True for Profluent E1-family models."""
     return _model_type(obj) == "E1"
+
+
+def _is_progen3_model(obj: Any) -> bool:
+    """Return True for Profluent ProGen3-family models."""
+    return _model_type(obj) == "progen3"
 
 
 def get_unembedding_matrix(model: Model) -> nn.Module:
@@ -156,7 +161,7 @@ def get_unembedding_matrix(model: Model) -> nn.Module:
             )
 
         # E1: mlm_head is Sequential(Linear → GELU → LayerNorm → Linear).
-        if _is_profluent_e1_model(model):
+        if _is_e1_model(model):
             mlm_head = getattr(model, "mlm_head", None)
             if mlm_head is not None and isinstance(mlm_head, nn.Sequential):
                 return mlm_head
@@ -165,12 +170,21 @@ def get_unembedding_matrix(model: Model) -> nn.Module:
             )
 
         # ProGen2: lm_head is a plain Linear(d_model, vocab, bias=True).
-        if _is_progen_model(model):
+        if _is_progen2_model(model):
             lm_head = getattr(model, "lm_head", None)
             if lm_head is not None and isinstance(lm_head, nn.Linear):
                 return lm_head
             raise ValueError(
                 f"error in extracting lm_head from ProGen2 model"
+            )
+
+        # ProGen3: lm_head is a plain Linear(d_model, vocab, bias=False).
+        if _is_progen3_model(model):
+            lm_head = getattr(model, "lm_head", None)
+            if lm_head is not None and isinstance(lm_head, nn.Linear):
+                return lm_head
+            raise ValueError(
+                f"error in extracting lm_head from ProGen3 model"
             )
 
         # Default path for all standard HuggingFace causal/masked LMs
@@ -215,11 +229,13 @@ def get_final_norm(model: Model) -> Norm:
     base_model = model.base_model
     if _is_t5_model(base_model):
         final_layer_norm = base_model.encoder.final_layer_norm
-    elif _is_profluent_e1_model(base_model):
+    elif _is_e1_model(base_model):
+        final_layer_norm = base_model.norm
+    elif _is_progen3_model(base_model):
         final_layer_norm = base_model.norm
     elif _is_esm_model(base_model): # should cover dplm as well!
         final_layer_norm = base_model.encoder.emb_layer_norm_after
-    elif _is_progen_model(base_model):
+    elif _is_progen2_model(base_model):
         final_layer_norm = base_model.ln_f
     elif isinstance(base_model, models.opt.modeling_opt.OPTModel):
         final_layer_norm = base_model.decoder.final_layer_norm
@@ -271,13 +287,16 @@ def get_transformer_layers(model: Model) -> tuple[str, th.nn.ModuleList]:
     if _is_t5_model(base_model):
         path_to_layers = "base_model.encoder.block"
         layer_list = base_model.encoder.block
-    elif _is_profluent_e1_model(base_model):
+    elif _is_e1_model(base_model):
+        path_to_layers = "base_model.layers"
+        layer_list = base_model.layers
+    elif _is_progen3_model(base_model):
         path_to_layers = "base_model.layers"
         layer_list = base_model.layers
     elif _is_esm_model(base_model):
         path_to_layers = "base_model.encoder.layer"
         layer_list = base_model.encoder.layer
-    elif _is_progen_model(base_model):
+    elif _is_progen2_model(base_model):
         path_to_layers = "base_model.h"
         layer_list = base_model.h
     elif isinstance(base_model, models.opt.modeling_opt.OPTModel):
