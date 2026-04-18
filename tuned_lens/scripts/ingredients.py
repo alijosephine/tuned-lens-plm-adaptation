@@ -119,7 +119,6 @@ class Data:
 
         return processed, nats_to_bpb
 
-#TODO: for E1 and ProGen3, i.e. profluent models, adapat the model loading (and maybe the tokenizer)!
 @dataclass
 class Model:
     """Configuration for the model and tokenizer."""

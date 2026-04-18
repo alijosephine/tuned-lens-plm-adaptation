@@ -4,6 +4,8 @@ As more non-HF protein language models are integrated (E1, ProGen3, ...),
 add their wrappers here so ingredients.py stays clean.
 """
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizer
@@ -80,7 +82,7 @@ class E1TokenizerWrapper(PreTrainedTokenizer):
     def __call__(
         self,
         texts,
-        max_length: int | None = None,
+        max_length: Optional[int] = None,
         padding=None,
         truncation: bool = False,
         return_attention_mask: bool = False,
@@ -198,7 +200,7 @@ class ProGen3TokenizerWrapper(PreTrainedTokenizer):
     def __call__(
         self,
         texts,
-        max_length: int | None = None,
+        max_length: Optional[int] = None,
         padding=None,
         truncation: bool = False,
         return_attention_mask: bool = False,

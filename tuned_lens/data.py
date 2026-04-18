@@ -77,6 +77,7 @@ def chunk_and_tokenize(
     For `model_type in {"masked", "encoder-decoder"}`, each sequence is tokenized independently and padded to
     `max_seq_len` so sample boundaries are preserved. (else attention across boundarie smight be an issue!)
     but use max_seq_len ~ 512 so that not many tokens wasted on padding (and that is roughly the length we use for deth analysis anyway!)
+    TODO: maybe worth accounting for the pad tokens in the later batches and gradient accummulation calculations....!
 
     Args:
         data: The dataset to chunk and tokenize.
@@ -151,7 +152,7 @@ def chunk_and_tokenize(
     def _tokenize_perseq_fn(x: dict[str, list]):
         if tokenizer.pad_token_id is None:
             raise ValueError(
-                "Masked tokenization requires a tokenizer with `pad_token_id`."
+                "Per sequence tokenization requires a tokenizer with `pad_token_id` to pad to max_len."
             )
 
         chunk_size = min(tokenizer.model_max_length, max_seq_len)
@@ -175,7 +176,13 @@ def chunk_and_tokenize(
 
         # Track non-padding token counts for metrics conversion.
         lengths = [sum(mask) for mask in attention_mask]
-        byte_counts = [len(text.encode("utf-8")) for text in original_texts]
+        # NOTE:Cap bytes at chunk_size - anything past the truncation point was not
+        # tokenized, so including those bytes would inflate `total_bytes`.
+        # For protein sequences (1 byte per AA in ASCII) chunk_size is an exact
+        # bound; but probably not for natural language, but we are now working with pLMs only for now!
+        byte_counts = [
+            len(text.encode("utf-8")[:chunk_size]) for text in original_texts
+        ]
 
         output["length"] = lengths
         output["bytes"] = byte_counts
@@ -193,6 +200,15 @@ def chunk_and_tokenize(
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
+    # TODO: review below hacky fix!
+    # E1 and progen3 tokenizer wrappers are not picklable, so multiprocessing
+    # workers hang at 0%. Use num_proc=1 to run in the main process instead.
+    effective_num_proc = (
+        1
+        if type(tokenizer).__name__ in {"E1TokenizerWrapper", "ProGen3TokenizerWrapper"}
+        else num_proc
+    )
+
     data = data.map(
         tokenize_fn,
         # Batching is important for ensuring that we don't waste tokens
@@ -200,7 +216,7 @@ def chunk_and_tokenize(
         # want to keep the batch size as large as possible
         batched=True,
         batch_size=2048,
-        num_proc=num_proc,
+        num_proc=effective_num_proc,
         remove_columns=get_columns_all_equal(data),
         load_from_cache_file=load_from_cache_file,
     )

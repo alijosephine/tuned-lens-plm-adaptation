@@ -312,6 +312,10 @@ class Train:
     ) -> int:
         """Calculate the number of batches of data to process before taking a step."""
         # chunk_and_tokenize ensures the samples are all the same length
+        # TODO: tokens_per_sample = max_seq_len for per-sequence tokenization,
+        # but a fraction of those positions are <pad> (excluded from CE loss via
+        # ignore_index=-100). So `tokens_per_step` over-counts real tokens for any
+        # model going through _tokenize_perseq_fn (all MLMs + ProGen3).
         samples_per_step, rem = divmod(self.tokens_per_step, tokens_per_sample)
         if rem:
             raise ValueError(
