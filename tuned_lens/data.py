@@ -200,15 +200,10 @@ def chunk_and_tokenize(
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
-    # TODO: review below hacky fix!
-    # E1 and progen3 tokenizer wrappers are not picklable, so multiprocessing
-    # workers hang at 0%. Use num_proc=1 to run in the main process instead.
-    effective_num_proc = (
-        1
-        if type(tokenizer).__name__ in {"E1TokenizerWrapper", "ProGen3TokenizerWrapper"}
-        else num_proc
-    )
-
+    # Review: E1 and ProGen3 wrappers pull in a Rust tokenizers.Tokenizer 
+    # that deadlock silently when datasets.Dataset.map forks workers 
+    # (rank 0 hangs at 0% and other ranks trip dist.barrier's 1200 s timeout).
+    # Hacky fix for now in in tuned_lens/__main__.py: see _maybe_force_spawn_for_profluent_loaders()
     data = data.map(
         tokenize_fn,
         # Batching is important for ensuring that we don't waste tokens
@@ -216,7 +211,7 @@ def chunk_and_tokenize(
         # want to keep the batch size as large as possible
         batched=True,
         batch_size=2048,
-        num_proc=effective_num_proc,
+        num_proc=num_proc,
         remove_columns=get_columns_all_equal(data),
         load_from_cache_file=load_from_cache_file,
     )

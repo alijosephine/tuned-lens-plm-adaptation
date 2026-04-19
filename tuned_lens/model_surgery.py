@@ -133,6 +133,16 @@ def _is_progen3_model(obj: Any) -> bool:
     return _model_type(obj) == "progen3"
 
 
+def _is_esm3_model(obj: Any) -> bool:
+    """Return True for EvolutionaryScale ESM3 wrapped via ESM3Wrapper.
+
+    Works on both the wrapper and its `base_model`: ESM3Wrapper mirrors its
+    config onto the inner ESM3 instance so the standard `base_model`-style
+    check used by other model families works here too.
+    """
+    return _model_type(obj) == "esm3"
+
+
 def get_unembedding_matrix(model: Model) -> nn.Module:
     """The final transformation from the model hidden state to the output logits.
 
@@ -167,6 +177,17 @@ def get_unembedding_matrix(model: Model) -> nn.Module:
                 return mlm_head
             raise ValueError(
                 f"error in extracting lm_head from E1 model"
+            )
+
+        # ESM3: output_heads.sequence_head is RegressionHead, an nn.Sequential
+        # of Linear → GELU → LayerNorm → Linear. base_model here is the inner
+        # raw ESM3 module (resolved via the wrapper's base_model_prefix).
+        if _is_esm3_model(model):
+            head = model.base_model.output_heads.sequence_head
+            if isinstance(head, nn.Sequential):
+                return head
+            raise ValueError(
+                f"error in extracting sequence_head from ESM3 model"
             )
 
         # ProGen2: lm_head is a plain Linear(d_model, vocab, bias=True).
@@ -235,6 +256,8 @@ def get_final_norm(model: Model) -> Norm:
         final_layer_norm = base_model.norm
     elif _is_esm_model(base_model): # should cover dplm as well!
         final_layer_norm = base_model.encoder.emb_layer_norm_after
+    elif _is_esm3_model(base_model):
+        final_layer_norm = base_model.transformer.norm
     elif _is_progen2_model(base_model):
         final_layer_norm = base_model.ln_f
     elif isinstance(base_model, models.opt.modeling_opt.OPTModel):
@@ -296,6 +319,9 @@ def get_transformer_layers(model: Model) -> tuple[str, th.nn.ModuleList]:
     elif _is_esm_model(base_model):
         path_to_layers = "base_model.encoder.layer"
         layer_list = base_model.encoder.layer
+    elif _is_esm3_model(base_model):
+        path_to_layers = "base_model.transformer.blocks"
+        layer_list = base_model.transformer.blocks
     elif _is_progen2_model(base_model):
         path_to_layers = "base_model.h"
         layer_list = base_model.h

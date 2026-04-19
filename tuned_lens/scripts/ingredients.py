@@ -38,7 +38,12 @@ from tuned_lens.data import (
     dataset_from_fasta,
 )
 from tuned_lens.model_surgery import get_transformer_layers
-from tuned_lens.model_wrappers import E1TokenizerWrapper, ProGen3TokenizerWrapper
+from tuned_lens.model_wrappers import (
+    E1TokenizerWrapper,
+    ESM3Config,
+    ESM3Wrapper,
+    ProGen3TokenizerWrapper,
+)
 from tuned_lens.nn.lenses import Lens
 from tuned_lens.utils import (
     TreeType,
@@ -153,12 +158,13 @@ class Model:
     - "encoder-decoder": use AutoModelForSeq2SeqLM (e.g. ProtT5).
     """
 
-    model_loader: Literal["huggingface", "e1", "progen3"] = "huggingface"
+    model_loader: Literal["huggingface", "e1", "progen3", "esm3"] = "huggingface"
     """Which loading backend to use.
 
     - "huggingface": standard HuggingFace Auto* classes (default).
     - "e1": Profluent E1 local installation.
     - "progen3": Profluent ProGen3 local installation.
+    - "esm3": EvolutionaryScale ESM3 (sequence stream only).
     """
 
     def load_tokenizer(self, must_use_cache: bool = False):
@@ -172,6 +178,11 @@ class Model:
 
         if self.model_loader == "progen3":
             return ProGen3TokenizerWrapper()
+
+        if self.model_loader == "esm3":
+            # EsmSequenceTokenizer is already a PreTrainedTokenizerFast — no wrapper needed.
+            from esm.tokenization import EsmSequenceTokenizer
+            return EsmSequenceTokenizer()
 
         with handle_name_conflicts():
             # T5TokenizerFast in newer transformers incorrectly tries to parse spiece.model
@@ -266,6 +277,21 @@ class Model:
                     local_files_only=must_use_cache,
                 )
             logger.info("Loaded ProGen3 model via local progen3 package.")
+        elif self.model_loader == "esm3":
+            # ESM3 has no HuggingFace integration; load via the upstream
+            # `esm.pretrained` factory and wrap in our PreTrainedModel adapter.
+            from esm.pretrained import ESM3_sm_open_v0
+            inner = ESM3_sm_open_v0(device=device or th.device("cpu"))
+            # Cast to float32 unless caller explicitly chose another precision.
+            # tuned-lens probes are f32; ESM3 defaults to bfloat16 on GPU which
+            # would cause dtype mismatch in the lens forward. Empirically
+            # validated by depth_analysis (their bfloat16 cast is commented out).
+            inner = inner.to(th.float32 if self.precision == "auto" else dtype)
+
+            # pad_token_id default in ESM3Config (1) matches EsmSequenceTokenizer.
+            config = ESM3Config(name_or_path=self.name)
+            model = ESM3Wrapper(config, esm3_model=inner)
+            logger.info("Loaded ESM3 (sequence-only) via local esm package.")
         else: #default: huggingface
             if self.model_type == "causal":
                 auto_model_cls = AutoModelForCausalLM

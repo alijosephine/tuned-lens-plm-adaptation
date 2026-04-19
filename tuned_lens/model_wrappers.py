@@ -1,14 +1,16 @@
 """Tokenizer and model wrappers for non-HuggingFace models.
 
-As more non-HF protein language models are integrated (E1, ProGen3, ...),
+As more non-HF protein language models are integrated (E1, ProGen3, ESM3, ...),
 add their wrappers here so ingredients.py stays clean.
 """
 
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedTokenizer
+from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizer
+from transformers.modeling_outputs import MaskedLMOutput
 
 
 class E1TokenizerWrapper(PreTrainedTokenizer):
@@ -264,3 +266,106 @@ class ProGen3TokenizerWrapper(PreTrainedTokenizer):
 
     def save_vocabulary(self, save_directory, filename_prefix=None):
         return ()
+
+
+class ESM3Config(PretrainedConfig):
+    """Minimal HF-style config for the wrapped ESM3 model (esm3_1.4b).
+
+    Values pinned to the EvolutionaryScale ESM3 `esm.pretrained.ESM3_sm_open_v0`, weights file `esm3_sm_open_v1.pth`, esm3_1.4b aka esm3-open':
+        d_model = 1536, 
+        n_heads = 24, 
+        v_heads = 256, 
+        n_layers = 48,
+        sequence vocab = 64.
+    Review: `tie_word_embeddings=False`: without it, PreTrainedModel's tie_weights() machinery 
+    would try to wire input/output embeddings, which doesn't make sense for ESM3.
+    """
+
+    model_type = "esm3"
+
+    def __init__(
+        self,
+        hidden_size: int = 1536,
+        num_hidden_layers: int = 48,
+        pad_token_id: int = 1,
+        tie_word_embeddings: bool = False,
+        **kwargs,
+    ):
+        super().__init__(
+            pad_token_id=pad_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+
+
+class ESM3Wrapper(PreTrainedModel):
+    """Adapter so EvolutionaryScale's ESM3 fits tuned-lens's expected interface.
+
+    The upstream `esm.models.esm3.ESM3` is a plain `nn.Module` (not a
+    PreTrainedModel) whose `forward()` only accepts `sequence_tokens=...`,
+    discards per-layer hidden states inside `TransformerStack.forward`, and
+    returns an `ESMOutput` dataclass with `sequence_logits` (not `logits`).
+
+    This wrapper:
+      - Subclasses PreTrainedModel so isinstance checks pass and `.base_model`
+        resolves to the inner ESM3 via `base_model_prefix`.
+      - Returns a `MaskedLMOutput` with HF-style `logits` and `hidden_states`
+        attributes (matches what tuned-lens's train_loop / eval_loop read).
+      - Captures per-block hidden states via a forward hook on
+        `inner.transformer`, prepending the encoder output so the tuple has
+        length `num_hidden_layers + 1` (HF convention; tuned-lens does
+        `output.hidden_states[:-1]` and iterates against `num_hidden_layers`
+        translators).
+      - `attention_mask` is silently ignored: ESM3 derives padding internally
+        from <pad> ids in `sequence_tokens`.
+
+    Review: NaN handling for unused tracks (structure/ss8/sasa/function/coords) 
+    is delegated to upstream ESM3.forward, which fills missing tracks with safe
+    defaults; `build_affine3d_from_coordinates` zeros NaN coords before any
+    matmul, so passing nothing for the structure side is correct and safe?
+    """
+
+    config_class = ESM3Config
+    base_model_prefix = "_model"
+    supports_gradient_checkpointing = False
+
+    def __init__(self, config: ESM3Config, esm3_model: nn.Module):
+        super().__init__(config)
+        self._model = esm3_model
+        # DO NOT call self.post_init(): the inner ESM3 weights are already loaded; post_init -> init_weights would re-initialise them.
+
+        # Mirror our config onto the inner ESM3 instance so that model_surgery
+        # type checks (`_is_esm3_model(base_model)`) work uniformly with how
+        # other models are checked. (Upstream ESM3 currently has no `.config` of its own.)
+        esm3_model.config = config
+
+    def _init_weights(self, module):
+        # Required-ish abstract on PreTrainedModel; never called for our use.
+        pass
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_hidden_states: bool = False,
+        **_,
+    ) -> MaskedLMOutput:
+        captured: dict = {}
+
+        def _hook(_module, inputs, output):
+            x_in = inputs[0]                      # encoder output = input to block 0
+            _, _, block_hiddens = output          # length N (one per block)
+            captured["hiddens"] = (x_in, *block_hiddens)   # length N+1, HF-style
+
+        h = self._model.transformer.register_forward_hook(_hook)
+        try:
+            esm_out = self._model(sequence_tokens=input_ids)
+        finally:
+            h.remove()
+
+        return MaskedLMOutput(
+            logits=esm_out.sequence_logits,
+            hidden_states=captured["hiddens"] if output_hidden_states else None,
+        )
