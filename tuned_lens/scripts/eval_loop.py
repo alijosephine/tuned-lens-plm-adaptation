@@ -439,3 +439,13 @@ class Eval:
             if self.record_logit_stats:
                 with (root_dir / "logit_stats.json").open("w") as f:
                     json.dump(logit_stats, f)
+
+
+# TODO: eval_loop.py curently adapted only for base masked model (ESM2) and base causal model (ProGen2).
+# Keep eval_loop in sync with train_loop for the new model families too (E1, ProGen3, ProtT5, ESM3, DPLM2).
+# Pending gaps (train_loop has these, eval_loop does not):
+#   1. (ProGen3) causal + padded models: no pad-token handling! 
+#      Need to capture `pad_token_id` from the tokenizer and
+#      build `valid_mask = batch["input_ids"] != pad_token_id` 
+#      and mask CE labels to -100 where they equal pad_token_id. (refer train_loop.py!)
+#   2. (ProtT5) Encoder-decoder + FSDP: refer train_loop.py for FSDP-wrapped ProtT5!

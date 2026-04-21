@@ -39,10 +39,12 @@ from tuned_lens.data import (
 )
 from tuned_lens.model_surgery import get_transformer_layers
 from tuned_lens.model_wrappers import (
+    DPLM2Wrapper,
     E1TokenizerWrapper,
     ESM3Config,
     ESM3Wrapper,
     ProGen3TokenizerWrapper,
+    adapt_dplm2_tokenizer,
 )
 from tuned_lens.nn.lenses import Lens
 from tuned_lens.utils import (
@@ -158,65 +160,76 @@ class Model:
     - "encoder-decoder": use AutoModelForSeq2SeqLM (e.g. ProtT5).
     """
 
-    model_loader: Literal["huggingface", "e1", "progen3", "esm3"] = "huggingface"
+    model_loader: Literal["huggingface", "e1", "progen3", "esm3", "dplm2"] = (
+        "huggingface"
+    )
     """Which loading backend to use.
 
     - "huggingface": standard HuggingFace Auto* classes (default).
     - "e1": Profluent E1 local installation.
     - "progen3": Profluent ProGen3 local installation.
     - "esm3": EvolutionaryScale ESM3 (sequence stream only).
+    - "dplm2": Bytedance DPLM2 via byprot ``MultimodalDiffusionProteinLanguageModel``
+      (sequence / AA stream; ``DPLM2Wrapper`` on ``.net``).
     """
 
-    def load_tokenizer(self, must_use_cache: bool = False):
+    def load_tokenizer(self, must_use_cache: bool = False) -> PreTrainedTokenizerBase:
         """Load the tokenizer.
 
-        Returns a PreTrainedTokenizerBase for HuggingFace models, or an
-        E1TokenizerWrapper for E1 (see tuned_lens/model_wrappers.py).
+        Returns a ``PreTrainedTokenizerBase`` for every supported loader. Custom
+        loaders (e1, progen3, esm3, dplm2) return wrapper subclasses defined in
+        ``tuned_lens/model_wrappers.py``; the HuggingFace default path uses
+        ``AutoTokenizer`` / ``T5Tokenizer``. A single isinstance check at the end
+        enforces the contract uniformly across all branches.
         """
         if self.model_loader == "e1":
-            return E1TokenizerWrapper()
-
-        if self.model_loader == "progen3":
-            return ProGen3TokenizerWrapper()
-
-        if self.model_loader == "esm3":
+            tokenizer = E1TokenizerWrapper()
+        elif self.model_loader == "progen3":
+            tokenizer = ProGen3TokenizerWrapper()
+        elif self.model_loader == "esm3":
             # EsmSequenceTokenizer is already a PreTrainedTokenizerFast — no wrapper needed.
             from esm.tokenization import EsmSequenceTokenizer
-            return EsmSequenceTokenizer()
-
-        with handle_name_conflicts():
-            # T5TokenizerFast in newer transformers incorrectly tries to parse spiece.model
-            # as a tiktoken file. Use T5Tokenizer (slow/SentencePiece) directly for T5 models.
-            if self.model_type == "encoder-decoder":
-                tokenizer = T5Tokenizer.from_pretrained(
-                    self.tokenizer or self.name,
-                    revision=self.revision,
-                    local_files_only=must_use_cache,
-                )
-            else:
-                tokenizer = AutoTokenizer.from_pretrained(
-                    self.tokenizer or self.name,
-                    revision=self.revision,
-                    use_fast=not self.slow_tokenizer,
-                    tokenizer_type=self.tokenizer_type,
-                    local_files_only=must_use_cache,
-                    trust_remote_code=self.trust_remote_code,
-                )
+            tokenizer = EsmSequenceTokenizer()
+        elif self.model_loader == "dplm2":
+            from byprot.models.dplm2.dplm2 import (
+                MultimodalDiffusionProteinLanguageModel as DPLM2,
+            )
+            with handle_name_conflicts():
+                mm = DPLM2.from_pretrained(self.name)
+            tokenizer = adapt_dplm2_tokenizer(mm.tokenizer)
+        else:  # default: huggingface
+            with handle_name_conflicts():
+                if self.model_type == "encoder-decoder":
+                    # T5TokenizerFast in newer transformers incorrectly tries to
+                    # parse spiece.model as a tiktoken file. Use T5Tokenizer
+                    # (slow/SentencePiece) directly for T5 models.
+                    tokenizer = T5Tokenizer.from_pretrained(
+                        self.tokenizer or self.name,
+                        revision=self.revision,
+                        local_files_only=must_use_cache,
+                    )
+                    # ProtT5 tokenizers do not define `mask_token` by default,
+                    # but expose sentinel extra ids. Reuse <extra_id_0> for MLM
+                    # masking when no mask token is set.
+                    if tokenizer.mask_token_id is None:
+                        sentinel = "<extra_id_0>"
+                        sentinel_id = tokenizer.convert_tokens_to_ids(sentinel)
+                        unk_id = getattr(tokenizer, "unk_token_id", None)
+                        if isinstance(sentinel_id, int) and (
+                            unk_id is None or sentinel_id != unk_id
+                        ):
+                            tokenizer.mask_token = sentinel
+                else:
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        self.tokenizer or self.name,
+                        revision=self.revision,
+                        use_fast=not self.slow_tokenizer,
+                        tokenizer_type=self.tokenizer_type,
+                        local_files_only=must_use_cache,
+                        trust_remote_code=self.trust_remote_code,
+                    )
 
         assert isinstance(tokenizer, PreTrainedTokenizerBase)
-
-        # ProtT5 tokenizers do not define `mask_token` by default, but expose
-        # sentinel extra ids. Reuse <extra_id_0> for MLM masking.
-        if (
-            self.model_type == "encoder-decoder"
-            and tokenizer.mask_token_id is None
-        ):
-            sentinel = "<extra_id_0>"
-            sentinel_id = tokenizer.convert_tokens_to_ids(sentinel)
-            unk_id = getattr(tokenizer, "unk_token_id", None)
-            if isinstance(sentinel_id, int) and (unk_id is None or sentinel_id != unk_id):
-                tokenizer.mask_token = sentinel
-
         return tokenizer
 
     def load(
@@ -292,7 +305,26 @@ class Model:
             config = ESM3Config(name_or_path=self.name)
             model = ESM3Wrapper(config, esm3_model=inner)
             logger.info("Loaded ESM3 (sequence-only) via local esm package.")
-        else: #default: huggingface
+        elif self.model_loader == "dplm2":
+            # The tokenizer is bundled inside the multimodal model but is reloaded
+            # separately again via `load_tokenizer()`. It is redundant but matches
+            # other models; Consider doing it only one-time here if much overhead or any mismatch!!
+            from byprot.models.dplm2.dplm2 import (
+                MultimodalDiffusionProteinLanguageModel as DPLM2,
+            )
+            with handle_name_conflicts():
+                mm = DPLM2.from_pretrained(self.name)
+            net = mm.net
+            if device is not None:
+                net = net.to(device=device)
+            if isinstance(dtype, th.dtype):
+                net = net.to(dtype=dtype)
+            model = DPLM2Wrapper(net, full_module=mm)
+            logger.info(
+                "Loaded DPLM2 sequence backbone via byprot "
+                "MultimodalDiffusionProteinLanguageModel (wrapped)."
+            )
+        else:  # default: huggingface
             if self.model_type == "causal":
                 auto_model_cls = AutoModelForCausalLM
             elif self.model_type == "masked":
@@ -319,7 +351,8 @@ class Model:
         model.eval()
         model.requires_grad_(False)
 
-        return model, self.load_tokenizer(must_use_cache=must_use_cache)
+        tokenizer = self.load_tokenizer(must_use_cache=must_use_cache)
+        return model, tokenizer
 
 
 class OptimizerOption(enum.Enum):

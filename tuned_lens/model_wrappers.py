@@ -1,6 +1,6 @@
 """Tokenizer and model wrappers for non-HuggingFace models.
 
-As more non-HF protein language models are integrated (E1, ProGen3, ESM3, ...),
+As more non-HF protein language models are integrated (E1, ProGen3, ESM3, DPLM2, ...),
 add their wrappers here so ingredients.py stays clean.
 """
 
@@ -369,3 +369,157 @@ class ESM3Wrapper(PreTrainedModel):
             logits=esm_out.sequence_logits,
             hidden_states=captured["hiddens"] if output_hidden_states else None,
         )
+
+
+# Token id boundary for DPLM2 multimodal vocab: AA ids are < 33, structure >= 33.
+# Same convention as depth_analysis DPLM2ModelWrapper._get_modality_type.
+_DPLM2_AA_TYPE_ID_BOUNDARY = 33
+
+class DPLM2Wrapper(PreTrainedModel):
+    """Adapter so DPLM2's ``EsmForDPLM2`` backbone fits tuned-lens's HF-style contract.
+
+    The upstream ``EsmForDPLM2.forward`` (byprot) returns a plain dict and does not
+    pass ``output_hidden_states`` into ``self.esm``, so tuned-lens never receives
+    per-layer states. This wrapper:
+
+      - Re-homes ``.esm`` and ``.lm_head`` under a ``PreTrainedModel`` with
+        ``base_model_prefix=\"esm\"`` so ``model_surgery`` ESM paths apply unchanged.
+      - Calls ``self.esm(..., output_hidden_states=..., type_ids=...)`` and applies
+        ``lm_head`` to the last hidden state.
+      - Returns ``MaskedLMOutput`` with ``logits`` and ``hidden_states``.
+
+    **Sequence-only (and AA-only FASTA)**: when ``type_ids`` is omitted, they are
+    inferred from ``input_ids`` (AA vs structure vs pad), matching the DPLM2
+    training convention: id < boundary → AA (type 1), id ≥ boundary → structure
+    (type 0), pad positions → type 2. Pure AA inputs therefore get type 1
+    everywhere except pads.
+
+    **Lifecycle**: construct with the ``.net`` attribute of
+    ``MultimodalDiffusionProteinLanguageModel`` (``EsmForDPLM2``). Optionally pass
+    ``full_module`` to retain a reference to the outer model (tokenizer, etc.).
+    """
+
+    # Backbone config is ESM-style (often EsmConfig); keep generic for DPLM2 forks.
+    config_class = PretrainedConfig
+    base_model_prefix = "esm"
+    supports_gradient_checkpointing = False
+
+    def __init__(self, backbone: nn.Module, *, full_module: Optional[nn.Module] = None):
+        """Args:
+            backbone: ``MultimodalDiffusionProteinLanguageModel.net`` (``EsmForDPLM2``).
+            full_module: Optional outer ``MultimodalDiffusionProteinLanguageModel`` to pin
+                in memory (otherwise only ``backbone`` is referenced).
+        """
+        if not hasattr(backbone, "esm") or not hasattr(backbone, "lm_head"):
+            raise ValueError(
+                "DPLM2Wrapper expects an EsmForDPLM2-like backbone with `.esm` and `.lm_head`."
+            )
+        config = getattr(backbone, "config", None)
+        if config is None:
+            raise ValueError("DPLM2 backbone must expose `.config`.")
+        super().__init__(config)
+        self.esm = backbone.esm
+        self.lm_head = backbone.lm_head
+        self._full_module = full_module
+        # backbone.pad_id (set by EsmForDPLM2) overrides config.pad_token_id (which is often None on the byprot config).
+        pad_id = getattr(backbone, "pad_id", None)
+        if pad_id is None:
+            pad_id = getattr(config, "pad_token_id", None) or 0
+        self._pad_id = int(pad_id)
+
+    def _init_weights(self, module):
+        pass
+
+    @staticmethod
+    def modality_type_ids(
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        *,
+        pad_token_id: int,
+        aa_boundary: int = _DPLM2_AA_TYPE_ID_BOUNDARY,
+    ) -> torch.Tensor:
+        """Per-position type ids: AA → 1, structure (id ≥ boundary) → 0, pad → 2.
+
+        Matches the DPLM2 / depth_analysis convention for ``ModifiedRotaryEmbedding``
+        (multimodal vs sequence-only branches). Pure AA FASTA yields 1 on residues
+        and 2 on pads.
+        """
+        if attention_mask is None:
+            input_mask = input_ids.ne(pad_token_id)
+        elif attention_mask.dtype != torch.bool:
+            input_mask = attention_mask.bool()
+        else:
+            input_mask = attention_mask
+        out = torch.zeros_like(input_ids, dtype=torch.long)
+        out[input_mask & (input_ids < aa_boundary)] = 1
+        out[input_mask & (input_ids >= aa_boundary)] = 0
+        out[~input_mask] = 2
+        return out
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_hidden_states: bool = False,
+        output_attentions: bool = False,
+        type_ids: Optional[torch.Tensor] = None,
+        **_,
+    ) -> MaskedLMOutput:
+        if attention_mask is None:
+            attention_mask = input_ids.ne(self._pad_id)
+        if type_ids is None:
+            type_ids = self.modality_type_ids(
+                input_ids, attention_mask, pad_token_id=self._pad_id
+            )
+
+        encoder_out = self.esm(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            return_dict=True,
+            type_ids=type_ids,
+        )
+        logits = self.lm_head(encoder_out.last_hidden_state)
+        return MaskedLMOutput(
+            loss=None,
+            logits=logits,
+            hidden_states=encoder_out.hidden_states if output_hidden_states else None,
+            attentions=encoder_out.attentions if output_attentions else None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# DPLM2 tokenizer adapter:
+# ---------------------------------------------------------------------------
+def adapt_dplm2_tokenizer(tok: PreTrainedTokenizer) -> PreTrainedTokenizer:
+    """Map DPLM2's ``aa_*`` specials onto standard HF slots in place (sequence-only).
+
+    Byprot's ``DPLM2Tokenizer`` already inherits from ``PreTrainedTokenizer`` (via
+    ``EsmTokenizer``), so ``isinstance(..., PreTrainedTokenizerBase)`` checks pass.
+    CLS / EOS / UNK / MASK each come in two flavours, ``aa_*`` and ``struct_*``,
+    to disambiguate the two streams; the standard HF slots are therefore left
+    unset by byprot. ``pad_token`` is shared across both modalities and is already
+    populated (default ``"<pad>"``), so it does NOT need remapping here.
+
+    Returns the same tokenizer instance for chaining.
+    """
+    # ``aa_*`` attributes are DPLM2-specific (not in PreTrainedTokenizerBase), so
+    # use ``getattr`` for those; standard HF slots are guaranteed to exist as
+    # properties returning ``None`` when unset, so direct attribute access is fine.
+    aa_mask = getattr(tok, "aa_mask_token", None)
+    aa_cls = getattr(tok, "aa_cls_token", None)
+    aa_eos = getattr(tok, "aa_eos_token", None)
+    aa_unk = getattr(tok, "aa_unk_token", None)
+
+    if tok.mask_token is None and aa_mask is not None:
+        tok.mask_token = aa_mask
+    if tok.cls_token is None and aa_cls is not None:
+        tok.cls_token = aa_cls
+    if tok.bos_token is None and aa_cls is not None:
+        tok.bos_token = aa_cls
+    if tok.eos_token is None and aa_eos is not None:
+        tok.eos_token = aa_eos
+    if tok.unk_token is None and aa_unk is not None:
+        tok.unk_token = aa_unk
+    return tok
