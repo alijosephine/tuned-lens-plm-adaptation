@@ -1,5 +1,20 @@
 # Tuned Lens Adaptation for Protein Language Models:  
 This is a fork of Tuned Lens with the intention of adapting it for protein langauge models. The relevant changes and documentation can be found in branch ```fork-branch```.  
+
+
+Supports below model families (across scale):  
+1. ESM2
+2. ESM3 (structure tokens excluded)
+3. DPLM
+4. DPLM2 (structure tokens excluded)
+5. Profluent-E1
+6. Profluent-ProGen3
+7. ProGen2
+8. ProtT5 (decoder layers excluded)
+
+ESM2, DPLM and ProGen2 require no additional installations (wired through HuggingFace). The remaining models require local installations (and to be used with the model/tokenizer wrappers newly added to this codebase).    
+
+
 (Preserving the original readme below.) 
 
 
